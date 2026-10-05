@@ -156,7 +156,7 @@ which is why it is written here and in the deploy notes rather than remembered.
 | `lldap_password_manager` credential disclosure | same delivery | holder can change passwords of directory users. Serious, and the reason this is not `lldap_admin` |
 | invite link forwarded or intercepted | single use, short expiry, no-referrer, never logged | whoever opens it first sets the password. The operator must send it over a channel he trusts |
 | denial of service on the public endpoint | whole-endpoint rate budget, `MemoryMax`, `CPUQuota` | a flood costs a few hundred refusals per minute. Per-IP limits were rejected as evadable by rotation |
-| guest reaches other hostnames | **not solved here.** Requires zero-by-default | this is the gating dependency. No invite is minted before `site-share-access` exists |
+| guest reaches other hostnames | **not solved here.** Requires zero-by-default | this is the gating dependency. No invite is minted before `site-files-access` exists |
 
 The last row is the important one. This service is safe to deploy with no invites
 outstanding, and it must not mint one until the access gate exists.

@@ -20,7 +20,7 @@ with open(os.path.join(_CREDS, "admin_password"), "w") as fh:
     fh.write("admin-password")
 
 os.environ["CREDENTIALS_DIRECTORY"] = _CREDS
-os.environ["PORTERO_GRANTABLE_GROUPS"] = "site-share-access,site-cal-access"
+os.environ["PORTERO_GRANTABLE_GROUPS"] = "site-files-access,site-cal-access"
 
 sys.path.insert(0, _HERE)
 import invites  # noqa: E402
@@ -31,7 +31,7 @@ REAL_GQL = M.gql  # captured before any test replaces it
 GROUPS = [
     {"id": 1, "displayName": "lldap_admin"},
     {"id": 13, "displayName": "files-admin"},
-    {"id": 20, "displayName": "site-share-access"},
+    {"id": 20, "displayName": "site-files-access"},
 ]
 
 
@@ -118,7 +118,7 @@ class Allowlist(Base):
         self.assertEqual(self.created, [])
 
     def test_allowlisted_group_is_granted(self):
-        r = self.post(self.good(site_access_groups=["site-share-access"]))
+        r = self.post(self.good(site_access_groups=["site-files-access"]))
         self.assertEqual(r.status_code, 201)
         self.assertEqual(self.added, [("dad", 20)])
 

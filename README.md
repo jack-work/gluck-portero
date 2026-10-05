@@ -34,7 +34,7 @@ Mint an invite. Send the link yourself.
 curl -sS https://portero.kelliher.info/invites \
   -H 'Content-Type: application/json' \
   -d '{"username":"dad","email":"dad@example.com",
-       "site_access_groups":["site-share-access"],"ttl_seconds":259200}'
+       "site_access_groups":["site-files-access"],"ttl_seconds":259200}'
 ```
 
 The response carries the URL once. It is not stored and cannot be re-read.
@@ -84,7 +84,7 @@ follow-on fix and it blocks nothing today.
 
 ## Two things that will bite
 
-**Do not mint an invite before `site-share-access` exists.** Until
+**Do not mint an invite before `site-files-access` exists.** Until
 zero-permissions-by-default lands, one unrestricted Authelia rule covers every
 gated hostname, so a new account reaches all of them. The service is safe to
 deploy with no invites outstanding; it is the first *invite* that is gated on

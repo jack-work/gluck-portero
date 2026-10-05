@@ -168,8 +168,16 @@ def set_password(username, password):
         env=env, capture_output=True, text=True, timeout=30,
     )
     if proc.returncode != 0:
-        # stderr may echo the request; log the code only.
-        log.error("set_password failed for %s: rc=%s", username, proc.returncode)
+        # Log the diagnosis, with the password scrubbed in case the tool ever
+        # echoes it back. Discarding stderr entirely hid a Rust panic behind a
+        # bare exit code and made a failure undiagnosable from the journal.
+        detail = ((proc.stderr or "") + (proc.stdout or "")).strip()
+        if password:
+            detail = detail.replace(password, "***")
+        log.error(
+            "set_password failed for %s: rc=%s %s",
+            username, proc.returncode, detail[:500],
+        )
         return False
     return True
 

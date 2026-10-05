@@ -95,7 +95,7 @@
 
             grantableGroups = lib.mkOption {
               type = lib.types.listOf lib.types.str;
-              default = [ "site-share-access" ];
+              default = [ "site-files-access" ];
               description = ''
                 The ONLY groups a mint call may put an invitee into. An allowlist,
                 not a pattern, because this half holds `lldap_admin`: without it a
@@ -200,6 +200,12 @@
                 PORTERO_REDEEM_USER = cfg.redeemUser;
                 PORTERO_MIN_PASSWORD = toString cfg.minPasswordLength;
                 PORTERO_SET_PASSWORD_BIN = setPasswordBin;
+                # lldap_set_password builds a reqwest client, and reqwest loads a
+                # CA bundle even for an http:// base url. Without one it PANICS
+                # with a bare "No such file or directory" and exit 101, which
+                # reads like a missing binary. Pinning the store bundle makes it
+                # independent of /etc and of this unit's ProtectSystem=strict.
+                SSL_CERT_FILE = "${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt";
                 PORTERO_LOGIN_URL = "https://auth.${
                   lib.head config.services.kelliher-web.baseDomains
                 }";
@@ -263,6 +269,25 @@
           spent = suite "spent" "test_spent.py";
           redeem = suite "redeem" "test_redeem.py";
           mint = suite "mint" "test_mint.py";
+
+          # The loop against a REAL lldap. No mocks, because mocks lied twice:
+          # one returned {"user": None} where lldap raises a GraphQL error, and
+          # every unit suite stayed green while mint 500'd on its first call.
+          # A mock that encodes your assumption cannot falsify it.
+          #
+          # This is the only test that caught anything, so it runs in CI rather
+          # than by hand. It asserts the two properties the design rests on:
+          # zero credential (no login until redemption) and single use.
+          integration = pkgs.runCommand "portero-integration"
+            {
+              nativeBuildInputs = [ py pkgs.lldap pkgs.curl pkgs.coreutils pkgs.gnused pkgs.gnugrep pkgs.cacert ];
+            } ''
+              set -o pipefail
+              export SRC=${porteroSrc pkgs}
+              export HOME=$TMPDIR
+              export SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt
+              bash ${./portero/integration.sh} 2>&1 | tee $out
+            '';
 
           # The check the unit tests could not make. They assembled their own
           # flat directory of every .py file, so they proved the CODE and said
