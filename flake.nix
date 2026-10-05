@@ -8,11 +8,30 @@
   outputs =
     { self, nixpkgs, gluck-service-lib, ... }:
     let
+      # The runtime package, as a DIRECTORY. Shared by the module and by the
+      # packaging check, deliberately: when the test built its own flat copy of
+      # every .py file, it passed while production shipped one file and died on
+      # `ModuleNotFoundError`. The check and the deploy now consume the same
+      # derivation, so they cannot disagree about what ships.
+      porteroSrc = pkgs: pkgs.runCommand "gluck-portero-src" { } ''
+        mkdir -p $out
+        cp ${./portero/invites.py} $out/invites.py
+        cp ${./portero/spent.py}   $out/spent.py
+        cp ${./portero/mint.py}    $out/mint.py
+        cp ${./portero/redeem.py}  $out/redeem.py
+      '';
+
       nixosModule =
         { config, lib, pkgs, ... }:
         let
           cfg = config.services.gluck-portero;
           setPasswordBin = "${pkgs.lldap}/bin/lldap_set_password";
+
+          # The entrypoints import sibling modules, so the package has to reach
+          # the store as a DIRECTORY. Passing `./portero/mint.py` copies that one
+          # file and nothing beside it, and the unit dies at startup on
+          # `ModuleNotFoundError: No module named 'invites'`.
+          src = porteroSrc pkgs;
         in
         {
           options.services.gluck-portero = {
@@ -145,7 +164,7 @@
               port = cfg.mintPort;
               requireAuth = true;
               requiredGroups = [ cfg.requiredGroup ];
-              entrypoint = ./portero/mint.py;
+              entrypoint = "${src}/mint.py";
               pythonPackages = ps: with ps; [ flask waitress requests ];
               stateDirectory = "gluck-portero-mint";
               environment = {
@@ -174,7 +193,7 @@
               subdomain = cfg.redeemSubdomain;
               port = cfg.redeemPort;
               requireAuth = false;
-              entrypoint = ./portero/redeem.py;
+              entrypoint = "${src}/redeem.py";
               pythonPackages = ps: with ps; [ flask waitress requests ];
               stateDirectory = "gluck-portero-redeem";
               environment = {
@@ -244,6 +263,43 @@
           spent = suite "spent" "test_spent.py";
           redeem = suite "redeem" "test_redeem.py";
           mint = suite "mint" "test_mint.py";
+
+          # The check the unit tests could not make. They assembled their own
+          # flat directory of every .py file, so they proved the CODE and said
+          # nothing about what the module SHIPS. This one imports both
+          # entrypoints out of the exact derivation the systemd units execute,
+          # which is where `ModuleNotFoundError: No module named 'invites'`
+          # actually lived. Negative control: drop a module from porteroSrc and
+          # this fails while all four suites above stay green.
+          packaging = pkgs.runCommand "portero-packaging" { } ''
+            set -o pipefail
+            SRC=${porteroSrc pkgs}
+
+            # Everything the units import must be present in the shipped tree.
+            for m in invites.py spent.py mint.py redeem.py; do
+              test -f "$SRC/$m" || { echo "MISSING from shipped tree: $m"; exit 1; }
+            done
+
+            # Tests must not ship.
+            if ls "$SRC" | grep -q '^test_'; then
+              echo "test files leaked into the runtime closure"; exit 1
+            fi
+
+            creds=$(mktemp -d); state=$(mktemp -d)
+            head -c 48 /dev/zero | tr '\0' 'k' > "$creds/invite_key"
+            echo stub > "$creds/admin_password"
+            echo stub > "$creds/redeem_password"
+
+            CREDENTIALS_DIRECTORY=$creds STATE_DIRECTORY=$state \
+            ${py}/bin/python3 - <<PY 2>&1 | tee $out
+            import sys
+            sys.path.insert(0, "$SRC")
+            import mint, redeem
+            assert hasattr(mint, "create_invite"), "mint entrypoint incomplete"
+            assert hasattr(redeem, "redeem"), "redeem entrypoint incomplete"
+            print("both entrypoints import from the shipped tree")
+            PY
+          '';
         });
     };
 }
