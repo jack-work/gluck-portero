@@ -45,7 +45,7 @@ class Base(unittest.TestCase):
 
         M.lldap_token = lambda: "fake-token"
 
-        def fake_gql(token, query, variables=None):
+        def fake_gql(token, query, variables=None, tolerate=()):
             variables = variables or {}
             if "createUser" in query:
                 self.created.append(variables["u"])
@@ -59,7 +59,16 @@ class Base(unittest.TestCase):
                 return {"groups": GROUPS}
             if "user(" in query:
                 uid = variables.get("id")
-                return {"user": {"id": uid} if uid in self.existing else None}
+                if uid in self.existing:
+                    return {"user": {"id": uid}}
+                # lldap answers an ABSENT user with a GraphQL error, not a null
+                # field, and REAL_GQL turns a tolerated error into None. The
+                # first version of this mock returned {"user": None}, which
+                # agreed with my assumption instead of with lldap, so the suite
+                # was green while production 500'd on every mint.
+                if tolerate and any("Entity not found" in t for t in tolerate):
+                    return None
+                raise RuntimeError("graphql error: Entity not found")
             raise AssertionError(f"unexpected query {query}")
 
         M.gql = fake_gql
@@ -196,7 +205,7 @@ class Creation(Base):
 
     def test_graphql_success_body_is_accepted(self):
         # Negative control for the test above: the same transport shape without
-        # an "errors" key must NOT raise, or the check is just rejecting everything.
+        # an "errors" key must NOT raise, or the check rejects everything.
         import requests as _rq
 
         class Resp:
@@ -219,6 +228,51 @@ class Creation(Base):
             )
         finally:
             _rq.post = real_post
+
+    def test_absent_user_reports_false_against_lldaps_real_error_shape(self):
+        # The production 500. lldap answers a missing user with a GraphQL ERROR,
+        # so user_exists must tolerate that one message and return False.
+        # Exercised through REAL_GQL, not the mock, so the mock cannot be the
+        # only witness to lldap's behaviour.
+        import requests as _rq
+
+        class Resp:
+            status_code = 200
+            @staticmethod
+            def raise_for_status(): return None
+            @staticmethod
+            def json():
+                return {"data": None, "errors": [
+                    {"message": "Entity not found: `dad`", "path": ["user"]}]}
+
+        real_post, real_gql = _rq.post, M.gql
+        _rq.post = lambda url, **kw: Resp()
+        M.gql = REAL_GQL
+        try:
+            self.assertFalse(M.user_exists("t", "dad"))
+        finally:
+            _rq.post, M.gql = real_post, real_gql
+
+    def test_other_graphql_errors_still_raise_from_user_exists(self):
+        # Tolerance must be narrow: only "Entity not found".
+        import requests as _rq
+
+        class Resp:
+            status_code = 200
+            @staticmethod
+            def raise_for_status(): return None
+            @staticmethod
+            def json():
+                return {"data": None, "errors": [{"message": "Unauthorized"}]}
+
+        real_post, real_gql = _rq.post, M.gql
+        _rq.post = lambda url, **kw: Resp()
+        M.gql = REAL_GQL
+        try:
+            with self.assertRaises(RuntimeError):
+                M.user_exists("t", "dad")
+        finally:
+            _rq.post, M.gql = real_post, real_gql
 
 
 if __name__ == "__main__":

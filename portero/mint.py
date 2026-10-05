@@ -75,7 +75,13 @@ def lldap_token():
     return r.json()["token"]
 
 
-def gql(token, query, variables=None):
+def gql(token, query, variables=None, tolerate=()):
+    """Run a GraphQL call. Raises on any error unless the message is tolerated.
+
+    lldap answers HTTP 200 with an "errors" key on failure, so a body has to be
+    inspected rather than a status code trusted. Failing loudly is the default;
+    `tolerate` is for the narrow cases where an error IS the expected answer.
+    """
     r = requests.post(
         f"{LLDAP_URL}/api/graphql",
         headers={"Authorization": f"Bearer {token}"},
@@ -84,17 +90,29 @@ def gql(token, query, variables=None):
     )
     r.raise_for_status()
     body = r.json()
-    # lldap returns application/json 200 with an "errors" key on failure. The
-    # existing lldap-bootstrap helper does not check this, which is how a failed
-    # provisioning step looks identical to a successful one.
-    if body.get("errors"):
-        raise RuntimeError(f"graphql error: {body['errors']}")
+    errors = body.get("errors")
+    if errors:
+        messages = " ".join(str(e.get("message", "")) for e in errors)
+        if tolerate and any(t in messages for t in tolerate):
+            return None
+        raise RuntimeError(f"graphql error: {errors}")
     return body["data"]
 
 
 def user_exists(token, username):
-    data = gql(token, "query($id:String!){user(userId:$id){id}}", {"id": username})
-    return data.get("user") is not None
+    """True if the account exists.
+
+    lldap reports an absent user as a GraphQL ERROR ("Entity not found"), not as
+    a null field, so the absence has to be tolerated explicitly here. Everywhere
+    else an error still fails loudly.
+    """
+    data = gql(
+        token,
+        "query($id:String!){user(userId:$id){id}}",
+        {"id": username},
+        tolerate=("Entity not found",),
+    )
+    return bool(data and data.get("user"))
 
 
 def group_id(token, name):
