@@ -32,8 +32,13 @@ REQUIRED_GROUP = os.environ.get("PORTERO_REQUIRED_GROUP", "portero-admin")
 REDEEM_BASE = os.environ.get("PORTERO_REDEEM_BASE", "https://invite.kelliher.info")
 DEFAULT_TTL = int(os.environ.get("PORTERO_DEFAULT_TTL", str(72 * 3600)))
 MAX_TTL = int(os.environ.get("PORTERO_MAX_TTL", str(14 * 24 * 3600)))
-INTAKE_DB = os.environ.get(
-    "PORTERO_INTAKE_DB", "/var/lib/gluck-portero-intake/intake.db"
+STATE_DIR = os.environ.get("STATE_DIRECTORY", "/var/lib/gluck-portero-mint")
+INTAKE_DB = os.environ.get("PORTERO_INTAKE_DB", os.path.join(STATE_DIR, "intake.db"))
+INTAKE_OFFSET = os.environ.get(
+    "PORTERO_INTAKE_OFFSET", os.path.join(STATE_DIR, "spool.offset")
+)
+INTAKE_SPOOL = os.environ.get(
+    "PORTERO_INTAKE_SPOOL", "/var/lib/gluck-portero-intake/spool.jsonl"
 )
 INTAKE_CAP = int(os.environ.get("PORTERO_INTAKE_CAP", "200"))
 
@@ -76,7 +81,9 @@ def intake():
     global _intake
     with _intake_lock:
         if _intake is None:
-            _intake = IntakeAdmin(INTAKE_DB, INTAKE_CAP)
+            _intake = IntakeAdmin(INTAKE_DB, INTAKE_CAP,
+                                  spool_path=INTAKE_SPOOL,
+                                  offset_path=INTAKE_OFFSET)
         return _intake
 
 
@@ -316,11 +323,17 @@ def list_intake():
     state = request.args.get("state", "pending")
     if state == "all":
         state = None
+    landed = intake().ingest()
     rows = intake().listing(state=state)
+    total, consumed = intake().spool_bytes()
     return jsonify(
         rows=[view(r) for r in rows],
         counts=intake().counts(),
         pending_capacity=INTAKE_CAP,
+        ingested_now=landed,
+        spool_bytes=total,
+        spool_consumed=consumed,
+        spool_max=int(os.environ.get("PORTERO_INTAKE_SPOOL_MAX", str(1 << 20))),
     )
 
 

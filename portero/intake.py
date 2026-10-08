@@ -1,13 +1,18 @@
 #!/usr/bin/env python3
-"""The intake half. It writes an address into a capped table and nothing else.
+"""The intake half. It appends an address to a write-only spool and nothing else.
 
-It holds no credential, reaches no directory, reads no row back and sends no
-mail. The only effect a request can have is one INSERT the caller never sees
-the outcome of: accepted, duplicate, malformed, flooded and full all render the
-same bytes with the same status after the same floor.
+It holds no credential, reaches no directory, sends no mail, and **cannot read
+back what it has written**: the spool is opened O_WRONLY|O_APPEND, so a read on
+that descriptor fails with EBADF. That property is the kernel's rather than
+this file's, and it survives a future author who stops reading this comment.
 
-So there is nothing here to steal and nothing to enumerate. Deciding on an
-address is the authenticated mint half's job.
+The only effect a request can have is one append the caller never sees the
+outcome of: accepted, duplicate, malformed, flooded and full all render the same
+bytes with the same status after the same floor.
+
+The spool is pre-created root-owned and is never created, renamed or removed
+here, so no dynamic user ever owns it. Deciding on an address, and the table
+itself, belong to the authenticated mint half.
 """
 
 import logging
@@ -20,10 +25,12 @@ from flask import Flask, Response, request
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from budget import Budget
-from pending import Intake
+from spool import Spool
 
-DB_PATH = os.environ.get("PORTERO_INTAKE_DB", "/var/lib/gluck-portero-intake/intake.db")
-CAP = int(os.environ.get("PORTERO_INTAKE_CAP", "200"))
+SPOOL_PATH = os.environ.get(
+    "PORTERO_INTAKE_SPOOL", "/var/lib/gluck-portero-intake/spool.jsonl"
+)
+SPOOL_MAX = int(os.environ.get("PORTERO_INTAKE_SPOOL_MAX", str(1 << 20)))
 FLOOR_SECONDS = float(os.environ.get("PORTERO_RESPONSE_FLOOR", "0.35"))
 MAX_EMAIL = 254
 MAX_NOTE = 280
@@ -37,7 +44,7 @@ FLOOD = Budget(
 
 app = Flask(__name__)
 log = logging.getLogger("portero-intake")
-STORE = Intake(DB_PATH, CAP)
+STORE = Spool(SPOOL_PATH, SPOOL_MAX)
 
 PAGE = """<!doctype html><meta charset=utf-8>
 <meta name=viewport content="width=device-width,initial-scale=1">

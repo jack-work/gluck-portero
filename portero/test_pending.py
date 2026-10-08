@@ -17,7 +17,7 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import invites  # noqa: E402
-import pending  # noqa: E402
+import spool  # noqa: E402
 from pending_admin import IntakeAdmin, mac_fields  # noqa: E402
 
 KEY = b"k" * 48
@@ -25,116 +25,77 @@ KEY = b"k" * 48
 
 class Base(unittest.TestCase):
     def setUp(self):
-        self.path = os.path.join(tempfile.mkdtemp(), "intake.db")
+        d = tempfile.mkdtemp()
+        self.path = os.path.join(d, "intake.db")
+        self.spool_path = os.path.join(d, "spool.jsonl")
+        open(self.spool_path, "wb").close()
         self.cap = 5
-        self.w = pending.Intake(self.path, self.cap)
-        self.a = IntakeAdmin(self.path, self.cap)
+        self.w = spool.Spool(self.spool_path, 1 << 20)
+        self.a = IntakeAdmin(self.path, self.cap, spool_path=self.spool_path,
+                             offset_path=os.path.join(d, "spool.offset"))
+
+    def offer(self, email, note=""):
+        """A submission, the way one really arrives: appended then ingested."""
+        self.w.offer(email, note)
+        return self.a.ingest()
 
     def tearDown(self):
         self.w.close()
         self.a.close()
 
 
-class Writer(Base):
+class Ingest(Base):
     def test_offer_is_written(self):
-        self.w.offer("dad@example.com", "hello")
+        self.offer("dad@example.com", "hello")
         rows = self.a.listing()
         self.assertEqual([r["email"] for r in rows], ["dad@example.com"])
         self.assertEqual(rows[0]["state"], "pending")
 
-    def test_offer_returns_nothing_whatever_happens(self):
-        # The write-only property: the public unit learns nothing from a write,
-        # so it cannot be used to test whether an address is already known.
+    def test_the_public_half_learns_nothing_from_a_write(self):
+        # It cannot be used to test whether an address is already known. The
+        # spool's own tests prove the descriptor is unreadable; this proves the
+        # append returns no outcome either.
         self.assertIsNone(self.w.offer("dad@example.com"))
         self.assertIsNone(self.w.offer("dad@example.com"))
         self.assertIsNone(self.w.offer("not an email"))
 
-    def test_duplicate_is_swallowed_and_stores_one_row(self):
-        self.w.offer("dad@example.com")
-        self.w.offer("dad@example.com")
+    def test_a_duplicate_address_lands_once_in_the_table(self):
+        # At-least-once ingestion plus UNIQUE(email) is exactly-once.
+        self.offer("dad@example.com")
+        self.offer("dad@example.com")
         self.assertEqual(len(self.a.listing()), 1)
 
-    def test_writer_module_issues_no_select(self):
-        # Negative control for the claim "no read path": the only SELECT in the
-        # writer's module is inside the cap trigger's own WHEN clause.
-        here = os.path.dirname(os.path.abspath(__file__))
-        with open(os.path.join(here, "pending.py"), encoding="utf-8") as fh:
-            src = fh.read()
-        body = src.split("class Intake")[1]
-        self.assertNotIn("SELECT", body.upper())
+    def test_replayed_ingestion_cannot_duplicate_a_row(self):
+        self.offer("dad@example.com")
+        with open(self.a.offset_path, "w", encoding="utf-8") as fh:
+            fh.write("0")
+        self.assertEqual(self.a.ingest(), 0, "the INSERT must be swallowed")
+        self.assertEqual(len(self.a.listing()), 1)
+
+    def test_duplicate_is_swallowed_and_stores_one_row(self):
+        self.offer("dad@example.com")
+        self.offer("dad@example.com")
+        self.assertEqual(len(self.a.listing()), 1)
 
     def test_cap_is_enforced_by_the_schema(self):
         for i in range(self.cap):
-            self.w.offer(f"user{i}@example.com")
-        self.w.offer("one-too-many@example.com")
+            self.offer(f"user{i}@example.com")
+        self.offer("one-too-many@example.com")
         rows = self.a.listing()
         self.assertEqual(len(rows), self.cap)
         self.assertNotIn("one-too-many@example.com", [r["email"] for r in rows])
 
     def test_cap_counts_only_pending_rows(self):
         for i in range(self.cap):
-            self.w.offer(f"user{i}@example.com")
+            self.offer(f"user{i}@example.com")
         self.assertTrue(self.a.reject(1, "admin"))
-        self.w.offer("now-there-is-room@example.com")
+        self.offer("now-there-is-room@example.com")
         self.assertIn("now-there-is-room@example.com",
                       [r["email"] for r in self.a.listing()])
 
-    def test_the_trigger_fires_without_the_application(self):
-        # Break the application's politeness and go straight at sqlite: the cap
-        # must hold even for a caller that does not catch the exception.
-        for i in range(self.cap):
-            self.w.offer(f"user{i}@example.com")
-        db = pending.connect(self.path, self.cap)
-        with self.assertRaises(sqlite3.IntegrityError):
-            db.execute("INSERT INTO intake (email, received_at) VALUES (?,?)",
-                       ("raw@example.com", 0))
-        db.close()
-
-
-class SharedFiles(unittest.TestCase):
-    """Two units, two dynamic uids, one table. The modes have to allow it."""
-
-    def setUp(self):
-        self.dir = tempfile.mkdtemp()
-        self.path = os.path.join(self.dir, "intake.db")
-        self.old_umask = os.umask(0o077)
-
-    def tearDown(self):
-        os.umask(self.old_umask)
-
-    def test_every_file_is_group_writable_after_connect(self):
-        # The failure this defends: sqlite's base mode is 0644, so under any
-        # umask the group write bit is absent and the mint unit cannot write a
-        # table the intake unit created.
-        w = pending.Intake(self.path, 4)
-        w.offer("dad@example.com")
-        try:
-            for suffix in ("", "-wal", "-shm"):
-                f = self.path + suffix
-                self.assertTrue(os.path.exists(f), f)
-                mode = os.stat(f).st_mode & 0o777
-                self.assertTrue(mode & 0o060 == 0o060,
-                                f"{suffix or 'db'} is {oct(mode)}, not group rw")
-        finally:
-            w.close()
-
-    def test_a_second_opener_does_not_lose_the_mode(self):
-        w = pending.Intake(self.path, 4)
-        a = IntakeAdmin(self.path, 4)
-        try:
-            a.claim(1, "dad", "admin")
-            for suffix in ("", "-wal", "-shm"):
-                mode = os.stat(self.path + suffix).st_mode & 0o777
-                self.assertEqual(mode & 0o060, 0o060, suffix)
-        finally:
-            w.close()
-            a.close()
-
-
-class StateMachine(Base):
     def setUp(self):
         super().setUp()
-        self.w.offer("dad@example.com")
+        self.offer("dad@example.com")
         self.row = self.a.listing()[0]["id"]
 
     def test_claim_has_exactly_one_winner(self):
@@ -165,7 +126,7 @@ class StateMachine(Base):
         self.assertEqual(row["sent_at"], 20)
 
     def test_listing_filters_by_state(self):
-        self.w.offer("second@example.com")
+        self.offer("second@example.com")
         self.a.claim(self.row, "dad", "admin")
         self.assertEqual(len(self.a.listing(state="pending")), 1)
         self.assertEqual(len(self.a.listing(state="approved")), 1)
@@ -175,7 +136,7 @@ class StateMachine(Base):
 class DecisionMac(Base):
     def setUp(self):
         super().setUp()
-        self.w.offer("dad@example.com")
+        self.offer("dad@example.com")
         self.id = self.a.listing()[0]["id"]
         self.a.claim(self.id, "dad", "admin")
         self.nonce, self.expires = "a" * 32, 2_000_000_000

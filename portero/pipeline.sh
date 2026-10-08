@@ -27,7 +27,9 @@ INTAKE_PORT=33983
 SMTP_PORT=33987
 ADMIN_PW=scratch-admin-password-2
 
-mkdir -p "$ROOT/creds" "$ROOT/state" "$ROOT/intake" "$ROOT/mail"
+mkdir -p "$ROOT/creds" "$ROOT/state" "$ROOT/intake" "$ROOT/mint-state" "$ROOT/mail"
+# Pre-created the way tmpfiles pre-creates it on spain: neither service makes it.
+: > "$ROOT/intake/spool.jsonl"
 cat > "$ROOT/cfg.toml" <<EOF
 ldap_host = "127.0.0.1"
 ldap_port = 33970
@@ -69,7 +71,8 @@ admin_code() {
     -H 'Remote-User: admin' -H 'Remote-Groups: portero-admin' "$@"
 }
 mail_count() { ls "$ROOT/mail" | wc -l | tr -d ' '; }
-sql() { sqlite3 "$ROOT/intake/intake.db" "$1"; }
+sql() { sqlite3 "$ROOT/mint-state/intake.db" "$1"; }
+spool_lines() { wc -l < "$ROOT/intake/spool.jsonl" | tr -d " "; }
 
 lldap run --config-file "$ROOT/cfg.toml" > "$ROOT/lldap.log" 2>&1 &
 python3 "$SRC_TESTS/fakesmtp.py" "$SMTP_PORT" "$ROOT/mail" > "$ROOT/sink.log" 2>&1 &
@@ -89,7 +92,9 @@ export PORTERO_GRANTABLE_GROUPS=site-files-access
 export PORTERO_RESPONSE_FLOOR=0.02
 export PORTERO_REDEEM_USER=admin
 export PORTERO_SET_PASSWORD_BIN=lldap_set_password
-export PORTERO_INTAKE_DB="$ROOT/intake/intake.db"
+export PORTERO_INTAKE_SPOOL="$ROOT/intake/spool.jsonl"
+export PORTERO_INTAKE_DB="$ROOT/mint-state/intake.db"
+export PORTERO_INTAKE_OFFSET="$ROOT/mint-state/spool.offset"
 export PORTERO_INTAKE_CAP=3
 export PORTERO_SMTP_HOST=127.0.0.1
 export PORTERO_SMTP_PORT=$SMTP_PORT
@@ -104,6 +109,7 @@ export PYTHONUNBUFFERED=1
 # redeem both refuse to start without one; this half must have nothing to hold.
 env -u CREDENTIALS_DIRECTORY PORT=$INTAKE_PORT \
   python3 "$SRC/intake.py" > "$ROOT/intake.log" 2>&1 &
+INTAKE_PID=$!
 
 export CREDENTIALS_DIRECTORY="$ROOT/creds"
 PORT=$MINT_PORT python3 "$SRC/mint.py" > "$ROOT/mint.log" 2>&1 &
@@ -119,8 +125,25 @@ say "intake runs with no credentials directory" "OK"
 # ── the public write ─────────────────────────────────────────────────────
 expect "POST an address to intake" 202 \
   "$(code -X POST "http://127.0.0.1:$INTAKE_PORT/intake" -d 'email=dad@example.com')"
-expect "one row landed" 1 "$(sql 'SELECT COUNT(*) FROM intake')"
+expect "one record in the spool" 1 "$(spool_lines)"
+# Not "the table is empty": mint has not opened a database at all, which is a
+# stronger statement and the reason an empty count read back blank here.
+expect "mint has not even created its table yet" absent \
+  "$(test -e "$ROOT/mint-state/intake.db" && echo present || echo absent)"
 expect "nothing was mailed by the public half" 0 "$(mail_count)"
+
+# The public half must be unable to read what it wrote, by the kernel's rule and
+# not by this suite's reading of the source. Read out of /proc, for the pid this
+# script started, so there is no guessing about which process is being examined.
+WRITE_ONLY=$(for fd in /proc/$INTAKE_PID/fd/*; do
+    target=$(readlink "$fd" 2>/dev/null) || continue
+    case "$target" in *spool.jsonl)
+      flags=$(awk '/^flags:/{print $2}' "/proc/$INTAKE_PID/fdinfo/$(basename "$fd")")
+      # O_WRONLY is 1 and O_APPEND is 02000 in the octal flags field.
+      case "$flags" in *1001|*2001) echo yes ;; *) echo "no:$flags" ;; esac ;;
+    esac
+  done | head -1)
+expect "the spool descriptor is write-only and append-only" yes "$WRITE_ONLY"
 
 GOOD=$(curl -s -X POST "http://127.0.0.1:$INTAKE_PORT/intake" -d 'email=two@example.com')
 DUPE=$(curl -s -X POST "http://127.0.0.1:$INTAKE_PORT/intake" -d 'email=two@example.com')
@@ -129,12 +152,27 @@ JUNK=$(curl -s -X POST "http://127.0.0.1:$INTAKE_PORT/intake" -d 'email=not-an-e
 [ "$GOOD" = "$JUNK" ] || fail "a malformed address renders differently"
 say "new, duplicate and malformed are byte-identical" "OK"
 
-# the cap, enforced by the schema and invisible to the caller
-curl -s -X POST "http://127.0.0.1:$INTAKE_PORT/intake" -d 'email=three@example.com' > /dev/null
-FULL=$(curl -s -X POST "http://127.0.0.1:$INTAKE_PORT/intake" -d 'email=four@example.com')
-[ "$GOOD" = "$FULL" ] || fail "a full table renders differently"
-expect "the cap held at PORTERO_INTAKE_CAP" 3 "$(sql 'SELECT COUNT(*) FROM intake')"
-say "a full table is indistinguishable from an accepted one" "OK"
+# ── the authenticated side ingests, and the queue is never stale ─────────
+# Three appends, two distinct addresses: the spool records every submission and
+# the table's UNIQUE(email) collapses the repeat. That is the exactly-once
+# property, measured rather than asserted in a comment.
+expect "the spool holds every append" 3 "$(spool_lines)"
+admin "http://127.0.0.1:$MINT_PORT/intake" > "$ROOT/list0.json"
+expect "the table holds the DISTINCT addresses" 2 \
+  "$(python3 -c "
+import json
+print(len(json.load(open('$ROOT/list0.json'))['rows']))")"
+expect "the spool is fully consumed" true \
+  "$(python3 -c "
+import json
+d = json.load(open('$ROOT/list0.json'))
+print(str(d['spool_consumed'] == d['spool_bytes']).lower())")"
+
+# Re-reading must not duplicate: at-least-once plus UNIQUE(email).
+printf '0' > "$ROOT/mint-state/spool.offset"
+admin "http://127.0.0.1:$MINT_PORT/intake" > /dev/null
+expect "replaying the whole spool duplicates nothing" 2 \
+  "$(sql 'SELECT COUNT(*) FROM intake')"
 
 # ── the authenticated read ───────────────────────────────────────────────
 expect "listing requires authentication" 401 \
@@ -207,15 +245,15 @@ URL2=$(link "$ROOT/mail/msg-2.txt")
 say "a resend carries the one live link, not another" "OK"
 
 # ── tampering with the row the public unit can write ────────────────────
-sqlite3 "$ROOT/intake/intake.db" \
+sqlite3 "$ROOT/mint-state/intake.db" \
   "UPDATE intake SET email='attacker@example.com' WHERE id=$RID"
 expect "send refuses a row whose recipient was rewritten" 409 \
   "$(admin_code -X POST "http://127.0.0.1:$MINT_PORT/intake/$RID/send")"
 expect "and mailed nothing" 2 "$(mail_count)"
-sqlite3 "$ROOT/intake/intake.db" \
+sqlite3 "$ROOT/mint-state/intake.db" \
   "UPDATE intake SET email='dad@example.com' WHERE id=$RID"
 
-sqlite3 "$ROOT/intake/intake.db" \
+sqlite3 "$ROOT/mint-state/intake.db" \
   "INSERT INTO intake (email, received_at, state, username, nonce, expires_at, mac)
    VALUES ('attacker@example.com', 0, 'approved', 'admin', 'deadbeef', 2000000000, 'forged')"
 FORGED=$(sql "SELECT id FROM intake WHERE email='attacker@example.com'")

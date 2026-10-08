@@ -18,7 +18,7 @@
         cp ${./portero/invites.py}       $out/invites.py
         cp ${./portero/spent.py}         $out/spent.py
         cp ${./portero/budget.py}        $out/budget.py
-        cp ${./portero/pending.py}       $out/pending.py
+        cp ${./portero/spool.py}         $out/spool.py
         cp ${./portero/pending_admin.py} $out/pending_admin.py
         cp ${./portero/mailer.py}        $out/mailer.py
         cp ${./portero/mint.py}          $out/mint.py
@@ -32,6 +32,7 @@
           cfg = config.services.gluck-portero;
           setPasswordBin = "${pkgs.lldap}/bin/lldap_set_password";
           intakeGroup = "portero-intake";
+          spoolFile = "${cfg.intakeDirectory}/spool.jsonl";
           py = pkgs.python3.withPackages (ps: with ps; [ flask waitress ]);
 
           # The entrypoints import sibling modules, so the package has to reach
@@ -160,10 +161,29 @@
               type = lib.types.int;
               default = 200;
               description = ''
-                Ceiling on PENDING intake rows. Enforced by a sqlite trigger
-                rather than by the application, so the public unit needs no
-                statement that reads the table back. Approving or rejecting a
-                row frees its slot.
+                Ceiling on PENDING rows in the mint half's table, enforced by a
+                sqlite trigger. Approving or rejecting a row frees its slot.
+              '';
+            };
+
+            intakeSpoolMax = lib.mkOption {
+              type = lib.types.int;
+              default = 1048576;
+              description = ''
+                Ceiling in BYTES on the write-only spool the public half appends
+                to. The public half enforces it with fstat on its own
+                descriptor, which is a size and not a read, so its blindness
+                survives the cap.
+
+                Nothing truncates the spool: a truncate from the consumer would
+                destroy any record appended between the read and the truncate,
+                which is a lost signup that the submitter cannot detect. mint
+                consumes by byte offset instead and never writes here.
+
+                At roughly 300 bytes a record this is about 3500 submissions.
+                Reclaiming it is a root-side chore with both units stopped, and
+                mint's GET /intake reports spool_bytes against spool_max so a
+                full spool is visible before it matters.
               '';
             };
 
@@ -257,7 +277,8 @@
                 PORTERO_GRANTABLE_GROUPS = lib.concatStringsSep "," cfg.grantableGroups;
                 PORTERO_DEFAULT_TTL = toString cfg.defaultTtlSeconds;
                 PORTERO_MAX_TTL = toString cfg.maxTtlSeconds;
-                PORTERO_INTAKE_DB = "${cfg.intakeDirectory}/intake.db";
+                PORTERO_INTAKE_SPOOL = spoolFile;
+                PORTERO_INTAKE_SPOOL_MAX = toString cfg.intakeSpoolMax;
                 PORTERO_INTAKE_CAP = toString cfg.intakeCap;
                 PORTERO_SMTP_HOST = cfg.smtpHost;
                 PORTERO_SMTP_PORT = toString cfg.smtpPort;
@@ -274,8 +295,6 @@
                 ] ++ lib.optional (cfg.smtpPasswordFile != null)
                   "smtp_password:${cfg.smtpPasswordFile}";
                 SupplementaryGroups = [ intakeGroup ];
-                ReadWritePaths = [ cfg.intakeDirectory ];
-                UMask = "0007";
                 MemoryMax = "192M";
                 CPUQuota = "40%";
               };
@@ -317,8 +336,12 @@
             {
               users.groups.${intakeGroup} = { };
 
+              # Both pre-created ROOT-OWNED, and neither service may create or
+              # remove them, so no dynamic user ever owns either one. A uid
+              # reassigned after a reboot therefore inherits nothing.
               systemd.tmpfiles.rules = [
-                "d ${cfg.intakeDirectory} 2770 root ${intakeGroup} -"
+                "d ${cfg.intakeDirectory} 0750 root ${intakeGroup} -"
+                "f ${spoolFile} 0660 root ${intakeGroup} -"
               ];
 
               systemd.services.gluck-portero-intake = {
@@ -328,14 +351,15 @@
                 wantedBy = [ "multi-user.target" ];
                 environment = {
                   PORT = toString cfg.intakePort;
-                  PORTERO_INTAKE_DB = "${cfg.intakeDirectory}/intake.db";
-                  PORTERO_INTAKE_CAP = toString cfg.intakeCap;
+                  PORTERO_INTAKE_SPOOL = spoolFile;
+                  PORTERO_INTAKE_SPOOL_MAX = toString cfg.intakeSpoolMax;
                 };
                 serviceConfig = gluck-service-lib.lib.defaultHardened // {
                   DynamicUser = true;
                   SupplementaryGroups = [ intakeGroup ];
-                  ReadWritePaths = [ cfg.intakeDirectory ];
-                  UMask = "0007";
+                  # The FILE, not the directory. The public half can append to
+                  # the spool and cannot create, rename or unlink anything.
+                  ReadWritePaths = [ spoolFile ];
                   ExecStart = "${py}/bin/python ${src}/intake.py";
                   Restart = "on-failure";
                   RestartSec = 5;
@@ -426,6 +450,7 @@
           redeem = suite "redeem" "test_redeem.py";
           mint = suite "mint" "test_mint.py";
           budget = suite "budget" "test_budget.py";
+          spool = suite "spool" "test_spool.py";
           pending = suite "pending" "test_pending.py";
           intake = suite "intake" "test_intake.py";
 
@@ -479,7 +504,7 @@
             SRC=${porteroSrc pkgs}
 
             # Everything the units import must be present in the shipped tree.
-            for m in invites.py spent.py budget.py pending.py pending_admin.py \
+            for m in invites.py spent.py budget.py spool.py pending_admin.py \
                      mailer.py mint.py redeem.py intake.py; do
               test -f "$SRC/$m" || { echo "MISSING from shipped tree: $m"; exit 1; }
             done
@@ -501,13 +526,23 @@
             # because the unit that runs it is given none. mint and redeem both
             # refuse to start without one, so this also proves the three are not
             # quietly sharing a startup path.
-            PORTERO_INTAKE_DB=$intake/intake.db \
+            : > $intake/spool.jsonl
+            PORTERO_INTAKE_SPOOL=$intake/spool.jsonl \
             ${py}/bin/python3 - <<PY 2>&1 | tee $out
-            import sys
+            import os, sys
             sys.path.insert(0, "$SRC")
             import intake
             assert hasattr(intake, "offer"), "intake entrypoint incomplete"
             assert not hasattr(intake, "mailer"), "the public half imports a mailer"
+            # The claim upgrade, checked against the SHIPPED tree: the public
+            # half's handle on the spool cannot be read, by the kernel's rule.
+            try:
+                os.read(intake.STORE._fd, 1)
+                raise AssertionError("the shipped intake half can READ its spool")
+            except OSError as exc:
+                assert exc.errno == 9, exc
+            assert "sqlite3" not in sys.modules, "the public half opened sqlite"
+            assert "pending_admin" not in sys.modules, "the public half imports the table"
             routes = sorted(str(r) for r in intake.app.url_map.iter_rules()
                             if not str(r).startswith("/static"))
             assert routes == ["/healthz", "/intake", "/intake"], routes

@@ -21,14 +21,19 @@ with open(os.path.join(_CREDS, "admin_password"), "w") as fh:
 
 os.environ["CREDENTIALS_DIRECTORY"] = _CREDS
 os.environ["PORTERO_GRANTABLE_GROUPS"] = "site-files-access,site-cal-access"
-os.environ["PORTERO_INTAKE_DB"] = os.path.join(tempfile.mkdtemp(), "intake.db")
+_MINT_STATE = tempfile.mkdtemp()
+_MINT_SPOOL = os.path.join(_MINT_STATE, "spool.jsonl")
+open(_MINT_SPOOL, "wb").close()
+os.environ["PORTERO_INTAKE_DB"] = os.path.join(_MINT_STATE, "intake.db")
+os.environ["PORTERO_INTAKE_SPOOL"] = _MINT_SPOOL
+os.environ["PORTERO_INTAKE_OFFSET"] = os.path.join(_MINT_STATE, "spool.offset")
 os.environ["PORTERO_INTAKE_CAP"] = "8"
 
 sys.path.insert(0, _HERE)
 import invites  # noqa: E402
 import mailer  # noqa: E402
 import mint as M  # noqa: E402
-import pending  # noqa: E402
+import spool  # noqa: E402
 
 REAL_GQL = M.gql  # captured before any test replaces it
 
@@ -297,7 +302,10 @@ class IntakeBase(Base):
         super().setUp()
         self.admin = M.intake()
         self.admin._db.execute("DELETE FROM intake")
-        self.writer = pending.Intake(M.INTAKE_DB, M.INTAKE_CAP)
+        open(_MINT_SPOOL, "wb").close()
+        with open(self.admin.offset_path, "w", encoding="utf-8") as fh:
+            fh.write("0")
+        self.writer = spool.Spool(_MINT_SPOOL, 1 << 20)
         self.mailed = []
 
         def fake_send(to, url, expires_at):
@@ -311,7 +319,9 @@ class IntakeBase(Base):
         self.writer.close()
 
     def row(self, email="dad@example.com"):
+        """A row as one really arrives: appended by the public half, ingested."""
         self.writer.offer(email)
+        self.admin.ingest()
         return self.admin.listing(state="pending")[-1]["id"]
 
     def call(self, path, body=None, user="admin", groups="portero-admin"):
@@ -351,6 +361,23 @@ class IntakeAuthorization(IntakeBase):
 
 
 class IntakeListing(IntakeBase):
+    def test_the_listing_ingests_so_the_queue_is_never_stale(self):
+        # The operator reads one endpoint and sees submissions that arrived a
+        # second ago, with no timer in between.
+        self.writer.offer("justnow@example.com")
+        body = self.listing().get_json()
+        self.assertEqual(body["ingested_now"], 1)
+        self.assertIn("justnow@example.com", [r["email"] for r in body["rows"]])
+
+    def test_the_listing_reports_the_spool_against_its_ceiling(self):
+        # A full spool silently drops signups, so it has to be visible on the
+        # authenticated side. It cannot be visible on the public side.
+        self.row("one@example.com")
+        body = self.listing().get_json()
+        self.assertGreater(body["spool_bytes"], 0)
+        self.assertEqual(body["spool_consumed"], body["spool_bytes"])
+        self.assertGreater(body["spool_max"], body["spool_bytes"])
+
     def test_pending_rows_are_listed_with_their_capacity(self):
         self.row("one@example.com")
         self.row("two@example.com")
