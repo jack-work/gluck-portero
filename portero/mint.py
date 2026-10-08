@@ -15,12 +15,16 @@ import logging
 import os
 import re
 import sys
+import threading
+import time
 
 import requests
 from flask import Flask, jsonify, request
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import invites
+import mailer
+from pending_admin import IntakeAdmin, mac_fields
 
 LLDAP_URL = os.environ.get("PORTERO_LLDAP_URL", "http://127.0.0.1:17170")
 ADMIN_USER = os.environ.get("PORTERO_ADMIN_USER", "admin")
@@ -28,6 +32,10 @@ REQUIRED_GROUP = os.environ.get("PORTERO_REQUIRED_GROUP", "portero-admin")
 REDEEM_BASE = os.environ.get("PORTERO_REDEEM_BASE", "https://invite.kelliher.info")
 DEFAULT_TTL = int(os.environ.get("PORTERO_DEFAULT_TTL", str(72 * 3600)))
 MAX_TTL = int(os.environ.get("PORTERO_MAX_TTL", str(14 * 24 * 3600)))
+INTAKE_DB = os.environ.get(
+    "PORTERO_INTAKE_DB", "/var/lib/gluck-portero-intake/intake.db"
+)
+INTAKE_CAP = int(os.environ.get("PORTERO_INTAKE_CAP", "200"))
 
 USERNAME_RE = re.compile(r"^[a-z][a-z0-9_-]{2,31}$")
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
@@ -54,6 +62,18 @@ SIGNING_KEY = invites.load_key(
     os.path.join(os.environ["CREDENTIALS_DIRECTORY"], "invite_key")
 )
 ADMIN_PASSWORD = credential("admin_password")
+
+
+_intake = None
+_intake_lock = threading.Lock()
+
+
+def intake():
+    global _intake
+    with _intake_lock:
+        if _intake is None:
+            _intake = IntakeAdmin(INTAKE_DB, INTAKE_CAP)
+        return _intake
 
 
 def caller():
@@ -134,20 +154,15 @@ def whoami():
     return jsonify(user=caller(), groups=caller_groups())
 
 
-@app.post("/invites")
-def create_invite():
+def forbidden():
     if not caller():
         return jsonify(error="unauthenticated"), 401
     if REQUIRED_GROUP not in caller_groups():
         return jsonify(error=f"requires group {REQUIRED_GROUP}"), 403
+    return None
 
-    body = request.get_json(silent=True) or {}
-    username = (body.get("username") or "").strip().lower()
-    email = (body.get("email") or "").strip()
-    display_name = (body.get("display_name") or "").strip()
-    ttl = int(body.get("ttl_seconds") or DEFAULT_TTL)
-    groups = body.get("site_access_groups") or []
 
+def invalid(username, email, ttl, groups):
     if not USERNAME_RE.fullmatch(username):
         return jsonify(error="invalid username (want ^[a-z][a-z0-9_-]{2,31}$)"), 400
     if not EMAIL_RE.fullmatch(email):
@@ -158,12 +173,15 @@ def create_invite():
         return jsonify(error="site_access_groups must be a list of strings"), 400
     refused = [g for g in groups if g not in GRANTABLE]
     if refused:
-        return jsonify(error=f"not grantable here: {refused}",
-                       grantable=GRANTABLE), 400
+        return jsonify(error=f"not grantable here: {refused}", grantable=GRANTABLE), 400
+    return None
 
+
+def provision(username, email, display_name, ttl, groups):
+    """Create the credential-less account, grant site access, mint one link."""
     token = lldap_token()
     if user_exists(token, username):
-        return jsonify(error="user already exists"), 409
+        return {"error": "user already exists"}, 409
 
     # Resolve every group BEFORE creating anything, so a typo does not leave a
     # half-provisioned account behind. Unknown group names are not validated by
@@ -172,7 +190,7 @@ def create_invite():
     for g in groups:
         gid = group_id(token, g)
         if gid is None:
-            return jsonify(error=f"group does not exist in the directory: {g}"), 400
+            return {"error": f"group does not exist in the directory: {g}"}, 400
         group_ids[g] = gid
 
     # No password field. The account exists and cannot be used.
@@ -200,29 +218,54 @@ def create_invite():
         username, caller(), sorted(group_ids), nonce, expires_at,
     )
     return (
-        jsonify(
-            username=username,
-            url=f"{REDEEM_BASE}/i/{invite}",
-            expires_at=expires_at,
-            site_access_groups=sorted(group_ids),
-            note=(
-                "Send this link yourself. It works once. The account exists with "
-                "no password until the invitee sets one, so there is no temporary "
-                "credential for anyone to leak."
-            ),
-        ),
+        {
+            "username": username,
+            "url": f"{REDEEM_BASE}/i/{invite}",
+            "nonce": nonce,
+            "expires_at": expires_at,
+            "site_access_groups": sorted(group_ids),
+        },
         201,
     )
+
+
+@app.post("/invites")
+def create_invite():
+    denied = forbidden()
+    if denied:
+        return denied
+
+    body = request.get_json(silent=True) or {}
+    username = (body.get("username") or "").strip().lower()
+    email = (body.get("email") or "").strip()
+    display_name = (body.get("display_name") or "").strip()
+    ttl = int(body.get("ttl_seconds") or DEFAULT_TTL)
+    groups = body.get("site_access_groups") or []
+
+    bad = invalid(username, email, ttl, groups)
+    if bad:
+        return bad
+
+    payload, status = provision(username, email, display_name, ttl, groups)
+    if status != 201:
+        return jsonify(payload), status
+    payload.pop("nonce")
+    payload["note"] = (
+        "Send this link yourself. It works once. The account exists with no "
+        "password until the invitee sets one, so there is no temporary "
+        "credential for anyone to leak."
+    )
+    return jsonify(payload), status
+
 
 
 @app.delete("/invites/<username>")
 def revoke(username):
     """Revocation is deleting the account. A token naming a user that does not
     exist cannot be redeemed, because setting its password fails."""
-    if not caller():
-        return jsonify(error="unauthenticated"), 401
-    if REQUIRED_GROUP not in caller_groups():
-        return jsonify(error=f"requires group {REQUIRED_GROUP}"), 403
+    denied = forbidden()
+    if denied:
+        return denied
     if not USERNAME_RE.fullmatch(username):
         return jsonify(error="invalid username"), 400
 
@@ -232,6 +275,150 @@ def revoke(username):
     gql(token, "mutation($id:String!){deleteUser(userId:$id){ok}}", {"id": username})
     log.info("account %s deleted by %s", username, caller())
     return jsonify(deleted=username), 200
+
+
+PUBLIC_ROW = (
+    "id", "email", "note", "received_at", "state", "username",
+    "decided_by", "decided_at", "expires_at", "sent_at", "send_count",
+)
+
+
+def view(row):
+    return {k: row[k] for k in PUBLIC_ROW}
+
+
+def deliver(row_id, email, url, expires_at, username):
+    try:
+        mailer.send_invite(email, url, expires_at)
+    except mailer.MailFailed as exc:
+        log.error("invite mail failed for %s: %s", username, exc)
+        return str(exc)
+    intake().record_sent(row_id)
+    log.info("invite mailed to %s for %s by %s", email, username, caller())
+    return None
+
+
+@app.get("/intake")
+def list_intake():
+    denied = forbidden()
+    if denied:
+        return denied
+    state = request.args.get("state", "pending")
+    if state == "all":
+        state = None
+    rows = intake().listing(state=state)
+    return jsonify(
+        rows=[view(r) for r in rows],
+        counts=intake().counts(),
+        pending_capacity=INTAKE_CAP,
+    )
+
+
+@app.post("/intake/<int:row_id>/reject")
+def reject_intake(row_id):
+    denied = forbidden()
+    if denied:
+        return denied
+    if not intake().reject(row_id, caller()):
+        return jsonify(error="no pending intake row with that id"), 409
+    log.info("intake row %s rejected by %s", row_id, caller())
+    return jsonify(rejected=row_id), 200
+
+
+@app.post("/intake/<int:row_id>/approve")
+def approve_intake(row_id):
+    denied = forbidden()
+    if denied:
+        return denied
+
+    body = request.get_json(silent=True) or {}
+    username = (body.get("username") or "").strip().lower()
+    display_name = (body.get("display_name") or "").strip()
+    ttl = int(body.get("ttl_seconds") or DEFAULT_TTL)
+    groups = body.get("site_access_groups") or []
+
+    row = intake().get(row_id)
+    if row is None:
+        return jsonify(error="no such intake row"), 404
+    if row["state"] != "pending":
+        return jsonify(error=f"intake row is {row['state']}, not pending"), 409
+
+    email = row["email"]
+    bad = invalid(username, email, ttl, groups)
+    if bad:
+        return bad
+
+    if not intake().claim(row_id, username, caller()):
+        return jsonify(error="intake row was decided by someone else"), 409
+
+    try:
+        payload, status = provision(username, email, display_name, ttl, groups)
+    except Exception:
+        intake().release(row_id)
+        raise
+    if status != 201:
+        intake().release(row_id)
+        return jsonify(payload), status
+
+    mac = invites.decision_mac(
+        SIGNING_KEY,
+        {"id": row_id, "email": email, "username": username,
+         "nonce": payload["nonce"], "expires_at": payload["expires_at"]},
+    )
+    intake().record_claim_material(row_id, payload["nonce"], payload["expires_at"], mac)
+
+    failure = deliver(row_id, email, payload["url"], payload["expires_at"], username)
+    payload.pop("nonce")
+    payload["intake_id"] = row_id
+    payload["mailed"] = failure is None
+    if failure:
+        payload["mail_error"] = failure
+        return jsonify(payload), 502
+    return jsonify(payload), 201
+
+
+@app.post("/intake/<int:row_id>/send")
+def send_intake(row_id):
+    """Mail the link for a row already approved, by id. The link itself never
+    appears in a request line, so no proxy log can hold a live token."""
+    denied = forbidden()
+    if denied:
+        return denied
+
+    row = intake().get(row_id)
+    if row is None:
+        return jsonify(error="no such intake row"), 404
+    if row["state"] != "approved" or not row["username"]:
+        return jsonify(error=f"intake row is {row['state']}, approve it first"), 409
+    if not invites.decision_ok(SIGNING_KEY, mac_fields(row), row["mac"]):
+        log.error("intake row %s fails its decision MAC: refusing to send", row_id)
+        return jsonify(error="intake row is not authentic; re-approve it"), 409
+
+    username = row["username"]
+    if not user_exists(lldap_token(), username):
+        return jsonify(error="the account no longer exists; it was revoked"), 409
+
+    now = int(time.time())
+    nonce, expires_at = row["nonce"], row["expires_at"]
+    if not nonce or not expires_at or expires_at <= now + 60:
+        token, nonce, expires_at = invites.mint(SIGNING_KEY, username, DEFAULT_TTL)
+        mac = invites.decision_mac(
+            SIGNING_KEY,
+            {"id": row_id, "email": row["email"], "username": username,
+             "nonce": nonce, "expires_at": expires_at},
+        )
+        intake().record_claim_material(row_id, nonce, expires_at, mac)
+        log.info("intake row %s re-minted for %s, nonce %s", row_id, username, nonce)
+    else:
+        token = invites.sign(SIGNING_KEY, username, expires_at, nonce)
+
+    failure = deliver(row_id, row["email"], f"{REDEEM_BASE}/i/{token}",
+                      expires_at, username)
+    if failure:
+        return jsonify(intake_id=row_id, mailed=False, mail_error=failure), 502
+    return jsonify(intake_id=row_id, username=username, mailed=True,
+                   expires_at=expires_at), 200
+
 
 
 def main():

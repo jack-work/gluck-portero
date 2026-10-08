@@ -28,8 +28,7 @@ with open(os.path.join(_CREDS, "redeem_password"), "w") as fh:
 
 os.environ["CREDENTIALS_DIRECTORY"] = _CREDS
 os.environ["STATE_DIRECTORY"] = _STATE
-os.environ["PORTERO_RESPONSE_FLOOR"] = "0.01"
-os.environ["PORTERO_RATE_LIMIT"] = "1000"
+os.environ["PORTERO_RESPONSE_FLOOR"] = "0.001"
 
 sys.path.insert(0, _HERE)
 import invites  # noqa: E402
@@ -42,8 +41,8 @@ class Base(unittest.TestCase):
         self.c = R.app.test_client()
         self.calls = []
         R.set_password = lambda u, p: (self.calls.append((u, p)), True)[1]
-        with R._hits_lock:
-            R._hits.clear()
+        for budget in list(R.FLOOD.values()) + list(R.PER_TOKEN.values()):
+            budget.reset()
 
     def tok(self, user="dad", ttl=3600):
         t, nonce, _ = invites.mint(KEY, user, ttl)
@@ -157,14 +156,63 @@ class Headers(Base):
 
 
 class Limits(Base):
-    def test_rate_limit_trips(self):
-        R.RATE_LIMIT, R.RATE_WINDOW = 3, 60
+    def test_a_get_flood_does_not_block_a_real_redemption(self):
+        # The bug: one whole-endpoint budget counted GETs, and mail scanners GET
+        # every link they see. Twenty scanner hits locked the endpoint for a
+        # minute, including the POST the invitee was trying to make.
+        t, _ = self.tok()
+        for _ in range(300):
+            self.c.get(f"/i/{t}")
+        r = self.c.post(f"/i/{t}", data={"password": "a-good-long-password",
+                                         "confirm": "a-good-long-password"})
+        self.assertEqual(r.status_code, 200, "a GET flood must not spend POSTs")
+
+    def test_a_get_never_spends_the_nonce(self):
+        t, nonce = self.tok()
+        for _ in range(300):
+            self.c.get(f"/i/{t}")
+        self.assertFalse(R.STORE.is_spent(nonce))
+        self.assertEqual(self.calls, [], "no GET may touch the directory")
+
+    def test_a_get_flood_on_one_token_does_not_touch_another(self):
+        mine, _ = self.tok("dad")
+        yours, _ = self.tok("mum")
+        R.PER_TOKEN["GET"].limit = 3
+        try:
+            codes = [self.c.get(f"/i/{mine}").status_code for _ in range(5)]
+            other = self.c.get(f"/i/{yours}").status_code
+        finally:
+            R.PER_TOKEN["GET"].limit = 60
+        self.assertEqual(codes, [200, 200, 200, 429, 429])
+        self.assertEqual(other, 200, "one invite must not spend another's budget")
+
+    def test_the_per_token_post_budget_trips(self):
+        t, nonce = self.tok()
+        R.PER_TOKEN["POST"].limit = 3
+        try:
+            codes = [self.c.post(f"/i/{t}", data={"password": "x",
+                                                  "confirm": "x"}).status_code
+                     for _ in range(5)]
+        finally:
+            R.PER_TOKEN["POST"].limit = 10
+        self.assertEqual(codes, [400, 400, 400, 429, 429])
+        self.assertFalse(R.STORE.is_spent(nonce), "guessing must not burn it")
+
+    def test_the_flood_ceiling_still_exists(self):
+        R.FLOOD["GET"].limit = 3
         try:
             codes = [self.c.get("/i/bogus").status_code for _ in range(5)]
         finally:
-            R.RATE_LIMIT, R.RATE_WINDOW = 1000, 60
-        self.assertEqual(codes[:3], [404, 404, 404])
-        self.assertEqual(codes[3:], [429, 429])
+            R.FLOOD["GET"].limit = 600
+        self.assertEqual(codes, [404, 404, 404, 429, 429])
+
+    def test_an_invalid_token_holds_no_per_token_budget(self):
+        # Memory, not politeness: a key per unverified token is a free way to
+        # make this process allocate. Only a signature-valid token gets a key.
+        before = R.PER_TOKEN["GET"].keys_held()
+        for i in range(500):
+            self.c.get(f"/i/forged-{i}")
+        self.assertEqual(R.PER_TOKEN["GET"].keys_held(), before)
 
     def test_healthz_is_open(self):
         self.assertEqual(self.c.get("/healthz").status_code, 200)

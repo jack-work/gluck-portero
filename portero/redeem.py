@@ -16,7 +16,6 @@ import logging
 import os
 import subprocess
 import sys
-import threading
 import time
 
 import requests
@@ -24,6 +23,7 @@ from flask import Flask, Response, request
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import invites
+from budget import Budget
 from spent import Spent
 
 LLDAP_URL = os.environ.get("PORTERO_LLDAP_URL", "http://127.0.0.1:17170")
@@ -34,11 +34,27 @@ MAX_PASSWORD = 256
 STATE_DIR = os.environ.get("STATE_DIRECTORY", "/var/lib/gluck-portero-redeem")
 SET_PASSWORD_BIN = os.environ.get("PORTERO_SET_PASSWORD_BIN", "lldap_set_password")
 
-# A whole-endpoint budget, not a per-IP one. Per-IP limits are evaded by
-# rotating IPs; this endpoint should see a handful of requests in its life, so a
-# global ceiling is both sufficient and unevadable.
-RATE_LIMIT = int(os.environ.get("PORTERO_RATE_LIMIT", "20"))
-RATE_WINDOW = int(os.environ.get("PORTERO_RATE_WINDOW", "60"))
+FLOOD = {
+    "GET": Budget(
+        int(os.environ.get("PORTERO_GET_FLOOD", "600")),
+        int(os.environ.get("PORTERO_FLOOD_WINDOW", "60")),
+    ),
+    "POST": Budget(
+        int(os.environ.get("PORTERO_POST_FLOOD", "120")),
+        int(os.environ.get("PORTERO_FLOOD_WINDOW", "60")),
+    ),
+}
+
+PER_TOKEN = {
+    "GET": Budget(
+        int(os.environ.get("PORTERO_TOKEN_GET_LIMIT", "60")),
+        int(os.environ.get("PORTERO_TOKEN_WINDOW", "300")),
+    ),
+    "POST": Budget(
+        int(os.environ.get("PORTERO_TOKEN_POST_LIMIT", "10")),
+        int(os.environ.get("PORTERO_TOKEN_WINDOW", "300")),
+    ),
+}
 
 # Every response takes at least this long, so a caller cannot tell a token that
 # failed its signature from one that was already spent.
@@ -62,21 +78,6 @@ SIGNING_KEY = invites.load_key(
 )
 SERVICE_PASSWORD = credential("redeem_password")
 STORE = Spent(os.path.join(STATE_DIR, "spent.db"))
-
-_hits = []
-_hits_lock = threading.Lock()
-
-
-def rate_limited(now=None):
-    now = now if now is not None else time.monotonic()
-    with _hits_lock:
-        cutoff = now - RATE_WINDOW
-        while _hits and _hits[0] < cutoff:
-            _hits.pop(0)
-        if len(_hits) >= RATE_LIMIT:
-            return True
-        _hits.append(now)
-        return False
 
 
 PAGE = """<!doctype html><meta charset=utf-8>
@@ -136,6 +137,11 @@ def refused():
     return page("Invitation not valid", REFUSED, status=404)
 
 
+def too_many():
+    return page("Too many attempts",
+                "<p>Too many attempts. Try again in a few minutes.</p>", status=429)
+
+
 def settle(started):
     """Hold every response to the same floor, so timing says nothing."""
     remaining = FLOOR_SECONDS - (time.monotonic() - started)
@@ -190,10 +196,10 @@ def healthz():
 @app.route("/i/<token>", methods=["GET", "POST"])
 def redeem(token):
     started = time.monotonic()
-    if rate_limited():
+    method = request.method
+    if not FLOOD[method].spend():
         settle(started)
-        return page("Too many attempts",
-                    "<p>Too many attempts. Try again in a minute.</p>", status=429)
+        return too_many()
 
     try:
         claim = invites.verify(SIGNING_KEY, token)
@@ -207,7 +213,11 @@ def redeem(token):
         settle(started)
         return refused()
 
-    if request.method == "GET":
+    if not PER_TOKEN[method].spend(nonce):
+        settle(started)
+        return too_many()
+
+    if method == "GET":
         settle(started)
         return page("Set your password",
                     FORM.format(username=username, minlen=MIN_PASSWORD, error=""))

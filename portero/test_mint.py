@@ -21,10 +21,14 @@ with open(os.path.join(_CREDS, "admin_password"), "w") as fh:
 
 os.environ["CREDENTIALS_DIRECTORY"] = _CREDS
 os.environ["PORTERO_GRANTABLE_GROUPS"] = "site-files-access,site-cal-access"
+os.environ["PORTERO_INTAKE_DB"] = os.path.join(tempfile.mkdtemp(), "intake.db")
+os.environ["PORTERO_INTAKE_CAP"] = "8"
 
 sys.path.insert(0, _HERE)
 import invites  # noqa: E402
+import mailer  # noqa: E402
 import mint as M  # noqa: E402
+import pending  # noqa: E402
 
 REAL_GQL = M.gql  # captured before any test replaces it
 
@@ -49,11 +53,13 @@ class Base(unittest.TestCase):
             variables = variables or {}
             if "createUser" in query:
                 self.created.append(variables["u"])
+                self.existing.add(variables["u"]["id"])
                 return {"createUser": {"id": variables["u"]["id"]}}
             if "addUserToGroup" in query:
                 self.added.append((variables["u"], variables["g"]))
                 return {"addUserToGroup": {"ok": True}}
             if "deleteUser" in query:
+                self.existing.discard(variables.get("id"))
                 return {"deleteUser": {"ok": True}}
             if "groups" in query:
                 return {"groups": GROUPS}
@@ -273,6 +279,278 @@ class Creation(Base):
                 M.user_exists("t", "dad")
         finally:
             _rq.post, M.gql = real_post, real_gql
+
+
+class IntakeBase(Base):
+    """The authenticated side of the intake pipeline."""
+
+    def setUp(self):
+        super().setUp()
+        self.admin = M.intake()
+        self.admin._db.execute("DELETE FROM intake")
+        self.writer = pending.Intake(M.INTAKE_DB, M.INTAKE_CAP)
+        self.mailed = []
+
+        def fake_send(to, url, expires_at):
+            self.mailed.append((to, url, expires_at))
+
+        self.real_send = mailer.send_invite
+        mailer.send_invite = fake_send
+
+    def tearDown(self):
+        mailer.send_invite = self.real_send
+        self.writer.close()
+
+    def row(self, email="dad@example.com"):
+        self.writer.offer(email)
+        return self.admin.listing(state="pending")[-1]["id"]
+
+    def call(self, path, body=None, user="admin", groups="portero-admin"):
+        headers = {}
+        if user is not None:
+            headers["Remote-User"] = user
+        if groups is not None:
+            headers["Remote-Groups"] = groups
+        return self.c.post(path, json=body or {}, headers=headers)
+
+    def listing(self, user="admin", groups="portero-admin", query=""):
+        headers = {}
+        if user is not None:
+            headers["Remote-User"] = user
+        if groups is not None:
+            headers["Remote-Groups"] = groups
+        return self.c.get(f"/intake{query}", headers=headers)
+
+
+class IntakeAuthorization(IntakeBase):
+    def test_every_intake_route_refuses_an_unauthenticated_caller(self):
+        rid = self.row()
+        self.assertEqual(self.listing(user=None).status_code, 401)
+        for path in (f"/intake/{rid}/approve", f"/intake/{rid}/send",
+                     f"/intake/{rid}/reject"):
+            self.assertEqual(self.call(path, user=None).status_code, 401)
+        self.assertEqual(self.created, [])
+
+    def test_every_intake_route_refuses_the_wrong_group(self):
+        rid = self.row()
+        self.assertEqual(self.listing(groups="files-admin").status_code, 403)
+        for path in (f"/intake/{rid}/approve", f"/intake/{rid}/send",
+                     f"/intake/{rid}/reject"):
+            self.assertEqual(self.call(path, groups="files-admin").status_code, 403)
+        self.assertEqual(self.created, [])
+        self.assertEqual(self.mailed, [])
+
+
+class IntakeListing(IntakeBase):
+    def test_pending_rows_are_listed_with_their_capacity(self):
+        self.row("one@example.com")
+        self.row("two@example.com")
+        body = self.listing().get_json()
+        self.assertEqual([r["email"] for r in body["rows"]],
+                         ["one@example.com", "two@example.com"])
+        self.assertEqual(body["pending_capacity"], M.INTAKE_CAP)
+        self.assertEqual(body["counts"], {"pending": 2})
+
+    def test_the_listing_never_carries_the_claim_material(self):
+        rid = self.row()
+        self.call(f"/intake/{rid}/approve", {"username": "dad"})
+        blob = self.listing(query="?state=all").get_data(as_text=True)
+        row = self.admin.get(rid)
+        self.assertNotIn(row["nonce"], blob)
+        self.assertNotIn(row["mac"], blob)
+
+
+class IntakeApproval(IntakeBase):
+    def test_approve_creates_the_account_and_mails_the_link(self):
+        rid = self.row("dad@example.com")
+        r = self.call(f"/intake/{rid}/approve",
+                      {"username": "dad", "site_access_groups": ["site-files-access"]})
+        self.assertEqual(r.status_code, 201)
+        self.assertTrue(r.get_json()["mailed"])
+        self.assertEqual(len(self.created), 1)
+        self.assertEqual(self.added, [("dad", 20)])
+        self.assertEqual(len(self.mailed), 1)
+        to, url, _ = self.mailed[0]
+        self.assertEqual(to, "dad@example.com")
+        claim = invites.verify(KEY, url.rsplit("/i/", 1)[1])
+        self.assertEqual(claim["username"], "dad")
+
+    def test_the_address_comes_from_the_row_not_the_request(self):
+        rid = self.row("dad@example.com")
+        self.call(f"/intake/{rid}/approve",
+                  {"username": "dad", "email": "attacker@example.com"})
+        self.assertEqual(self.mailed[0][0], "dad@example.com")
+        self.assertEqual(self.created[0]["email"], "dad@example.com")
+
+    def test_the_allowlist_still_applies_to_an_approval(self):
+        rid = self.row()
+        r = self.call(f"/intake/{rid}/approve",
+                      {"username": "dad", "site_access_groups": ["lldap_admin"]})
+        self.assertEqual(r.status_code, 400)
+        self.assertEqual(self.created, [])
+        self.assertEqual(self.mailed, [])
+        self.assertEqual(self.admin.get(rid)["state"], "pending")
+
+    def test_an_existing_user_leaves_the_row_pending(self):
+        self.existing.add("dad")
+        rid = self.row()
+        r = self.call(f"/intake/{rid}/approve", {"username": "dad"})
+        self.assertEqual(r.status_code, 409)
+        self.assertEqual(self.admin.get(rid)["state"], "pending",
+                         "a failed approval must be retryable")
+        self.assertEqual(self.mailed, [])
+
+    def test_a_directory_failure_releases_the_row(self):
+        rid = self.row()
+        M.gql = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("lldap is down"))
+        with self.assertRaises(RuntimeError):
+            self.call(f"/intake/{rid}/approve", {"username": "dad"})
+        self.assertEqual(self.admin.get(rid)["state"], "pending")
+
+    def test_a_row_is_approved_once(self):
+        rid = self.row()
+        first = self.call(f"/intake/{rid}/approve", {"username": "dad"})
+        second = self.call(f"/intake/{rid}/approve", {"username": "dad2"})
+        self.assertEqual(first.status_code, 201)
+        self.assertEqual(second.status_code, 409)
+        self.assertEqual(len(self.created), 1)
+
+    def test_mail_failure_is_a_502_that_keeps_the_account(self):
+        rid = self.row()
+
+        def boom(to, url, expires_at):
+            raise mailer.MailFailed("smtp refused mail to x: SMTPDataError")
+
+        mailer.send_invite = boom
+        r = self.call(f"/intake/{rid}/approve", {"username": "dad"})
+        self.assertEqual(r.status_code, 502)
+        self.assertFalse(r.get_json()["mailed"])
+        self.assertEqual(len(self.created), 1)
+        self.assertEqual(self.admin.get(rid)["state"], "approved")
+        self.assertIsNone(self.admin.get(rid)["sent_at"])
+
+    def test_rejecting_frees_the_cap_and_blocks_approval(self):
+        rid = self.row()
+        self.assertEqual(self.call(f"/intake/{rid}/reject").status_code, 200)
+        self.assertEqual(self.call(f"/intake/{rid}/approve",
+                                   {"username": "dad"}).status_code, 409)
+        self.assertEqual(self.created, [])
+
+
+class SendById(IntakeBase):
+    def approved(self, email="dad@example.com", username="dad"):
+        rid = self.row(email)
+        self.call(f"/intake/{rid}/approve", {"username": username})
+        self.mailed.clear()
+        return rid
+
+    def test_send_resends_the_same_link(self):
+        rid = self.approved()
+        before = self.admin.get(rid)["nonce"]
+        r = self.call(f"/intake/{rid}/send")
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(len(self.mailed), 1)
+        token = self.mailed[0][1].rsplit("/i/", 1)[1]
+        self.assertEqual(invites.verify(KEY, token)["nonce"], before,
+                         "a resend must not create a second live link")
+
+    def test_send_counts_up(self):
+        rid = self.approved()
+        self.call(f"/intake/{rid}/send")
+        self.call(f"/intake/{rid}/send")
+        self.assertEqual(self.admin.get(rid)["send_count"], 3)
+
+    def test_send_refuses_a_pending_row(self):
+        rid = self.row()
+        self.assertEqual(self.call(f"/intake/{rid}/send").status_code, 409)
+        self.assertEqual(self.mailed, [])
+
+    def test_send_refuses_an_unknown_row(self):
+        self.assertEqual(self.call("/intake/99999/send").status_code, 404)
+
+    def test_send_refuses_a_revoked_account(self):
+        rid = self.approved()
+        self.existing.discard("dad")
+        self.assertEqual(self.call(f"/intake/{rid}/send").status_code, 409)
+        self.assertEqual(self.mailed, [])
+
+    def test_send_refuses_a_row_whose_recipient_was_rewritten(self):
+        # The intake unit can write this table. Repointing an approved row at
+        # an attacker's address must not get a working link mailed to it.
+        rid = self.approved()
+        self.admin._db.execute("UPDATE intake SET email='evil@example.com' "
+                               "WHERE id=?", (rid,))
+        r = self.call(f"/intake/{rid}/send")
+        self.assertEqual(r.status_code, 409)
+        self.assertIn(b"not authentic", r.data)
+        self.assertEqual(self.mailed, [])
+
+    def test_send_refuses_a_row_whose_username_was_rewritten(self):
+        rid = self.approved()
+        self.existing.add("admin")
+        self.admin._db.execute("UPDATE intake SET username='admin' WHERE id=?",
+                               (rid,))
+        r = self.call(f"/intake/{rid}/send")
+        self.assertEqual(r.status_code, 409)
+        self.assertEqual(self.mailed, [])
+
+    def test_send_refuses_a_row_forged_wholesale(self):
+        self.existing.add("admin")
+        self.admin._db.execute(
+            "INSERT INTO intake (email, received_at, state, username, nonce, "
+            "expires_at, mac) VALUES (?,?,?,?,?,?,?)",
+            ("evil@example.com", 0, "approved", "admin", "b" * 32,
+             2_000_000_000, "forged"),
+        )
+        rid = self.admin.listing(state="approved")[-1]["id"]
+        self.assertEqual(self.call(f"/intake/{rid}/send").status_code, 409)
+        self.assertEqual(self.mailed, [])
+
+    def test_an_expired_claim_is_re_minted(self):
+        rid = self.approved()
+        self.admin._db.execute("UPDATE intake SET expires_at=1 WHERE id=?", (rid,))
+        row = self.admin.get(rid)
+        self.admin.record_claim_material(
+            rid, row["nonce"], 1,
+            invites.decision_mac(KEY, {"id": rid, "email": row["email"],
+                                       "username": "dad", "nonce": row["nonce"],
+                                       "expires_at": 1}))
+        r = self.call(f"/intake/{rid}/send")
+        self.assertEqual(r.status_code, 200)
+        token = self.mailed[0][1].rsplit("/i/", 1)[1]
+        self.assertEqual(invites.verify(KEY, token)["username"], "dad")
+        self.assertNotEqual(self.admin.get(rid)["nonce"], row["nonce"])
+
+
+class MintLogging(IntakeBase):
+    def test_the_link_never_reaches_a_log(self):
+        rid = self.row()
+        with self.assertLogs("portero-mint", level="INFO") as cap:
+            self.call(f"/intake/{rid}/approve", {"username": "dad"})
+            self.call(f"/intake/{rid}/send")
+        blob = "\n".join(cap.output)
+        url = self.mailed[0][1]
+        token = url.rsplit("/i/", 1)[1]
+        self.assertNotIn(url, blob)
+        self.assertNotIn(token, blob)
+        self.assertNotIn(token.split(".")[0], blob)
+        self.assertIn("dad", blob)
+
+    def test_a_mail_failure_logs_no_link(self):
+        rid = self.row()
+        self.call(f"/intake/{rid}/approve", {"username": "dad"})
+        url = self.mailed[0][1]
+
+        def boom(to, url_, expires_at):
+            raise mailer.MailFailed(f"smtp refused mail to {to}: SMTPDataError")
+
+        mailer.send_invite = boom
+        with self.assertLogs("portero-mint", level="INFO") as cap:
+            self.call(f"/intake/{rid}/send")
+        blob = "\n".join(cap.output)
+        self.assertNotIn(url, blob)
+        self.assertNotIn(url.rsplit("/i/", 1)[1], blob)
+        self.assertIn("smtp refused", blob)
 
 
 if __name__ == "__main__":

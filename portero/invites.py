@@ -40,6 +40,19 @@ def load_key(path):
     return key
 
 
+def sign(key, username, expires_at, nonce):
+    """Rebuild the exact token for a claim already decided. Deterministic."""
+    payload = _b64e(
+        json.dumps(
+            {"u": username, "e": int(expires_at), "n": nonce},
+            separators=(",", ":"),
+            sort_keys=True,
+        ).encode("utf-8")
+    )
+    sig = _b64e(hmac.new(key, payload.encode("ascii"), hashlib.sha256).digest())
+    return f"{payload}.{sig}"
+
+
 def mint(key, username, ttl_seconds, now=None):
     """Return (token, nonce, expires_at). The caller shows the token once."""
     if ttl_seconds <= 0:
@@ -47,15 +60,28 @@ def mint(key, username, ttl_seconds, now=None):
     now = int(now if now is not None else time.time())
     expires_at = now + int(ttl_seconds)
     nonce = secrets.token_hex(NONCE_BYTES // 2)
-    payload = _b64e(
-        json.dumps(
-            {"u": username, "e": expires_at, "n": nonce},
-            separators=(",", ":"),
-            sort_keys=True,
-        ).encode("utf-8")
-    )
-    sig = _b64e(hmac.new(key, payload.encode("ascii"), hashlib.sha256).digest())
-    return f"{payload}.{sig}", nonce, expires_at
+    return sign(key, username, expires_at, nonce), nonce, expires_at
+
+
+def decision_mac(key, fields):
+    """Authenticate a decision this estate made about an intake row.
+
+    The row lives in a database the public intake unit can write. Only a holder
+    of the signing key can produce this, so a forged or edited row cannot be
+    mailed a working link.
+    """
+    blob = json.dumps(
+        {k: ("" if v is None else str(v)) for k, v in fields.items()},
+        separators=(",", ":"),
+        sort_keys=True,
+    ).encode("utf-8")
+    return _b64e(hmac.new(key, b"intake-decision." + blob, hashlib.sha256).digest())
+
+
+def decision_ok(key, fields, mac):
+    if not isinstance(mac, str) or not mac:
+        return False
+    return hmac.compare_digest(decision_mac(key, fields), mac)
 
 
 def verify(key, token, now=None):

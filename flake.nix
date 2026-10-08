@@ -15,10 +15,15 @@
       # derivation, so they cannot disagree about what ships.
       porteroSrc = pkgs: pkgs.runCommand "gluck-portero-src" { } ''
         mkdir -p $out
-        cp ${./portero/invites.py} $out/invites.py
-        cp ${./portero/spent.py}   $out/spent.py
-        cp ${./portero/mint.py}    $out/mint.py
-        cp ${./portero/redeem.py}  $out/redeem.py
+        cp ${./portero/invites.py}       $out/invites.py
+        cp ${./portero/spent.py}         $out/spent.py
+        cp ${./portero/budget.py}        $out/budget.py
+        cp ${./portero/pending.py}       $out/pending.py
+        cp ${./portero/pending_admin.py} $out/pending_admin.py
+        cp ${./portero/mailer.py}        $out/mailer.py
+        cp ${./portero/mint.py}          $out/mint.py
+        cp ${./portero/redeem.py}        $out/redeem.py
+        cp ${./portero/intake.py}        $out/intake.py
       '';
 
       nixosModule =
@@ -26,6 +31,8 @@
         let
           cfg = config.services.gluck-portero;
           setPasswordBin = "${pkgs.lldap}/bin/lldap_set_password";
+          intakeGroup = "gluck-portero-intake";
+          py = pkgs.python3.withPackages (ps: with ps; [ flask waitress ]);
 
           # The entrypoints import sibling modules, so the package has to reach
           # the store as a DIRECTORY. Passing `./portero/mint.py` copies that one
@@ -138,6 +145,83 @@
               default = 9102;
             };
 
+            intakePort = lib.mkOption {
+              type = lib.types.port;
+              default = 9103;
+              description = ''
+                Loopback port for the intake unit, which is served under
+                `/intake` on the PUBLIC redeem hostname rather than on a name
+                of its own. One fewer public hostname, and no DNS record to
+                add.
+              '';
+            };
+
+            intakeCap = lib.mkOption {
+              type = lib.types.int;
+              default = 200;
+              description = ''
+                Ceiling on PENDING intake rows. Enforced by a sqlite trigger
+                rather than by the application, so the public unit needs no
+                statement that reads the table back. Approving or rejecting a
+                row frees its slot.
+              '';
+            };
+
+            intakeDirectory = lib.mkOption {
+              type = lib.types.str;
+              default = "/var/lib/gluck-portero-intake";
+              description = ''
+                Directory holding the intake table. The intake unit writes it
+                and the mint unit reads it; both reach it through the
+                `gluck-portero-intake` group, and neither has any other path in
+                common.
+
+                This is state OUTSIDE the closure. Rolling spain back past this
+                change leaves the directory and its rows in place; removing it
+                is the revocation, and it is one `rm -rf`.
+              '';
+            };
+
+            smtpPasswordFile = lib.mkOption {
+              type = lib.types.nullOr lib.types.path;
+              default = null;
+              description = ''
+                SES SMTP password for the MINT half, delivered by
+                LoadCredential. Null means this estate sends no invite mail and
+                the operator carries the link himself; the mail routes then
+                answer 502 and say so.
+
+                The redeem and intake halves never receive this. Only the
+                authenticated half can cause mail to be sent.
+              '';
+            };
+
+            smtpHost = lib.mkOption {
+              type = lib.types.str;
+              default = "email-smtp.us-east-1.amazonaws.com";
+            };
+
+            smtpPort = lib.mkOption {
+              type = lib.types.port;
+              default = 587;
+            };
+
+            smtpUser = lib.mkOption {
+              type = lib.types.str;
+              default = "";
+              description = "SES SMTP username. Not a secret; the password is.";
+            };
+
+            smtpSender = lib.mkOption {
+              type = lib.types.str;
+              default = "kelliher.info <auth@kelliher.info>";
+              description = ''
+                Envelope and header sender. SES authorizes this credential for
+                one identity, so a value it cannot send as fails at send time
+                and not at build time.
+              '';
+            };
+
             defaultTtlSeconds = lib.mkOption {
               type = lib.types.int;
               default = 72 * 3600;
@@ -173,6 +257,12 @@
                 PORTERO_GRANTABLE_GROUPS = lib.concatStringsSep "," cfg.grantableGroups;
                 PORTERO_DEFAULT_TTL = toString cfg.defaultTtlSeconds;
                 PORTERO_MAX_TTL = toString cfg.maxTtlSeconds;
+                PORTERO_INTAKE_DB = "${cfg.intakeDirectory}/intake.db";
+                PORTERO_INTAKE_CAP = toString cfg.intakeCap;
+                PORTERO_SMTP_HOST = cfg.smtpHost;
+                PORTERO_SMTP_PORT = toString cfg.smtpPort;
+                PORTERO_SMTP_USER = lib.optionalString (cfg.smtpPasswordFile != null) cfg.smtpUser;
+                PORTERO_SMTP_SENDER = cfg.smtpSender;
                 PORTERO_REDEEM_BASE = "https://${cfg.redeemSubdomain}.${
                   lib.head config.services.kelliher-web.baseDomains
                 }";
@@ -181,7 +271,11 @@
                 LoadCredential = [
                   "invite_key:${cfg.inviteKeyFile}"
                   "admin_password:${cfg.adminPasswordFile}"
-                ];
+                ] ++ lib.optional (cfg.smtpPasswordFile != null)
+                  "smtp_password:${cfg.smtpPasswordFile}";
+                SupplementaryGroups = [ intakeGroup ];
+                ReadWritePaths = [ cfg.intakeDirectory ];
+                UMask = "0007";
                 MemoryMax = "192M";
                 CPUQuota = "40%";
               };
@@ -221,10 +315,52 @@
             })
 
             {
+              users.groups.${intakeGroup} = { };
+
+              systemd.tmpfiles.rules = [
+                "d ${cfg.intakeDirectory} 2770 root ${intakeGroup} -"
+              ];
+
+              systemd.services.gluck-portero-intake = {
+                description = "gluck-portero-intake: the public write-only signup table";
+                after = [ "network.target" "systemd-tmpfiles-setup.service" ];
+                requires = [ "systemd-tmpfiles-setup.service" ];
+                wantedBy = [ "multi-user.target" ];
+                environment = {
+                  PORT = toString cfg.intakePort;
+                  PORTERO_INTAKE_DB = "${cfg.intakeDirectory}/intake.db";
+                  PORTERO_INTAKE_CAP = toString cfg.intakeCap;
+                };
+                serviceConfig = gluck-service-lib.lib.defaultHardened // {
+                  DynamicUser = true;
+                  SupplementaryGroups = [ intakeGroup ];
+                  ReadWritePaths = [ cfg.intakeDirectory ];
+                  UMask = "0007";
+                  ExecStart = "${py}/bin/python ${src}/intake.py";
+                  Restart = "on-failure";
+                  RestartSec = 5;
+                  MemoryMax = "128M";
+                  CPUQuota = "25%";
+                };
+              };
+
+              services.kelliher-web.sites.gluck-portero-mint.trustsRemoteHeaders = true;
+
+              services.kelliher-web.sites.gluck-portero-redeem.extraConfig = ''
+                handle /intake* {
+                  reverse_proxy localhost:${toString cfg.intakePort}
+                }
+              '';
+
               assertions = [
                 {
                   assertion = cfg.mintPort != cfg.redeemPort;
                   message = "gluck-portero: mintPort and redeemPort must differ.";
+                }
+                {
+                  assertion =
+                    cfg.intakePort != cfg.mintPort && cfg.intakePort != cfg.redeemPort;
+                  message = "gluck-portero: intakePort collides with another half.";
                 }
                 {
                   assertion = cfg.redeemPasswordFile != cfg.adminPasswordFile;
@@ -242,8 +378,28 @@
                   assertion = cfg.minPasswordLength >= 10;
                   message = "gluck-portero: minPasswordLength below 10 is not acceptable.";
                 }
+                {
+                  assertion = cfg.intakeCap >= 1;
+                  message = "gluck-portero: intakeCap below 1 accepts no signup at all.";
+                }
+                {
+                  assertion = cfg.smtpPasswordFile == null || cfg.smtpUser != "";
+                  message =
+                    "gluck-portero: smtpPasswordFile is set but smtpUser is empty, so "
+                    + "mint would hold a mail credential it cannot authenticate with "
+                    + "and every send would fail at the SMTP greeting.";
+                }
+                {
+                  assertion =
+                    cfg.smtpPasswordFile == null
+                    || (cfg.smtpPasswordFile != cfg.redeemPasswordFile
+                        && cfg.smtpPasswordFile != cfg.inviteKeyFile);
+                  message =
+                    "gluck-portero: smtpPasswordFile aliases another credential.";
+                }
               ];
             }
+
           ]);
         };
 
@@ -269,6 +425,9 @@
           spent = suite "spent" "test_spent.py";
           redeem = suite "redeem" "test_redeem.py";
           mint = suite "mint" "test_mint.py";
+          budget = suite "budget" "test_budget.py";
+          pending = suite "pending" "test_pending.py";
+          intake = suite "intake" "test_intake.py";
 
           # The loop against a REAL lldap. No mocks, because mocks lied twice:
           # one returned {"user": None} where lldap raises a GraphQL error, and
@@ -289,6 +448,25 @@
               bash ${./portero/integration.sh} 2>&1 | tee $out
             '';
 
+          # The intake pipeline, against the same real lldap and a real SMTP
+          # server on a scratch port. The message asserted here left the mint
+          # process over a socket, so "it mails the link" is observed rather
+          # than inferred from a stubbed sender.
+          pipeline = pkgs.runCommand "portero-pipeline"
+            {
+              nativeBuildInputs = [
+                py pkgs.lldap pkgs.curl pkgs.coreutils pkgs.gnused pkgs.gnugrep
+                pkgs.sqlite pkgs.cacert
+              ];
+            } ''
+              set -o pipefail
+              export SRC=${porteroSrc pkgs}
+              export SRC_TESTS=${./portero}
+              export HOME=$TMPDIR
+              export SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt
+              bash ${./portero/pipeline.sh} 2>&1 | tee $out
+            '';
+
           # The check the unit tests could not make. They assembled their own
           # flat directory of every .py file, so they proved the CODE and said
           # nothing about what the module SHIPS. This one imports both
@@ -301,7 +479,8 @@
             SRC=${porteroSrc pkgs}
 
             # Everything the units import must be present in the shipped tree.
-            for m in invites.py spent.py mint.py redeem.py; do
+            for m in invites.py spent.py budget.py pending.py pending_admin.py \
+                     mailer.py mint.py redeem.py intake.py; do
               test -f "$SRC/$m" || { echo "MISSING from shipped tree: $m"; exit 1; }
             done
 
@@ -309,21 +488,54 @@
             if ls "$SRC" | grep -q '^test_'; then
               echo "test files leaked into the runtime closure"; exit 1
             fi
+            if test -e "$SRC/fakesmtp.py"; then
+              echo "the SMTP test sink leaked into the runtime closure"; exit 1
+            fi
 
-            creds=$(mktemp -d); state=$(mktemp -d)
+            creds=$(mktemp -d); state=$(mktemp -d); intake=$(mktemp -d)
             head -c 48 /dev/zero | tr '\0' 'k' > "$creds/invite_key"
             echo stub > "$creds/admin_password"
             echo stub > "$creds/redeem_password"
 
-            CREDENTIALS_DIRECTORY=$creds STATE_DIRECTORY=$state \
+            # The intake entrypoint is imported with NO credentials directory,
+            # because the unit that runs it is given none. mint and redeem both
+            # refuse to start without one, so this also proves the three are not
+            # quietly sharing a startup path.
+            PORTERO_INTAKE_DB=$intake/intake.db \
             ${py}/bin/python3 - <<PY 2>&1 | tee $out
+            import sys
+            sys.path.insert(0, "$SRC")
+            import intake
+            assert hasattr(intake, "offer"), "intake entrypoint incomplete"
+            assert not hasattr(intake, "mailer"), "the public half imports a mailer"
+            routes = sorted(str(r) for r in intake.app.url_map.iter_rules()
+                            if not str(r).startswith("/static"))
+            assert routes == ["/healthz", "/intake", "/intake"], routes
+            print("intake imports and serves three routes with no credential")
+            PY
+
+            CREDENTIALS_DIRECTORY=$creds STATE_DIRECTORY=$state \
+            PORTERO_INTAKE_DB=$intake/intake.db \
+            ${py}/bin/python3 - <<PY 2>&1 | tee -a $out
             import sys
             sys.path.insert(0, "$SRC")
             import mint, redeem
             assert hasattr(mint, "create_invite"), "mint entrypoint incomplete"
+            assert hasattr(mint, "approve_intake"), "mint lacks the intake routes"
+            assert hasattr(mint, "send_intake"), "mint lacks send by id"
             assert hasattr(redeem, "redeem"), "redeem entrypoint incomplete"
+            assert "mailer" not in dir(redeem), "the redeem half imports a mailer"
+            assert "pending_admin" not in dir(redeem), "redeem holds a read path"
             print("both entrypoints import from the shipped tree")
             PY
+
+            for half in redeem intake; do
+              if grep -Eq '^(import mailer|from mailer)' "$SRC/$half.py"; then
+                echo "$half.py imports the mailer: a public half can send mail"
+                exit 1
+              fi
+            done
+            echo "neither public half can send mail" | tee -a $out
           '';
         });
     };
