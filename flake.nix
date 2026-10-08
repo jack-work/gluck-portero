@@ -31,7 +31,7 @@
         let
           cfg = config.services.gluck-portero;
           setPasswordBin = "${pkgs.lldap}/bin/lldap_set_password";
-          intakeGroup = "gluck-portero-intake";
+          intakeGroup = "portero-intake";
           py = pkgs.python3.withPackages (ps: with ps; [ flask waitress ]);
 
           # The entrypoints import sibling modules, so the package has to reach
@@ -173,7 +173,7 @@
               description = ''
                 Directory holding the intake table. The intake unit writes it
                 and the mint unit reads it; both reach it through the
-                `gluck-portero-intake` group, and neither has any other path in
+                `portero-intake` group, and neither has any other path in
                 common.
 
                 This is state OUTSIDE the closure. Rolling spain back past this

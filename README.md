@@ -116,9 +116,13 @@ guest before any rollback past the enforcement change.
 | intake | `127.0.0.1:9103`, INSERT into the intake table and nothing else |
 
 The intake table lives in `/var/lib/gluck-portero-intake`, shared through the
-`gluck-portero-intake` group and nothing else. It is **state outside the
-closure**: a rollback does not remove it, and the revocation is one
-`rm -rf /var/lib/gluck-portero-intake`.
+`portero-intake` group and nothing else. The group is **not** named after the
+unit: systemd allocates a `DynamicUser` named after the unit and refuses to
+start if a static user or group already holds that name, which is a `217/USER`
+exit with "User or group with specified name already exists".
+
+The directory is **state outside the closure**: a rollback does not remove it,
+and the revocation is one `rm -rf /var/lib/gluck-portero-intake`.
 
 All three loopback; only Caddy reaches them. Intake is served under `/intake` on
 the redeem hostname rather than a name of its own, so there is no DNS record to
