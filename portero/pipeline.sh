@@ -230,6 +230,18 @@ expect "POST the chosen password" 200 \
 expect "login after redeeming" 200 "$(login 'MailedToDad-9912')"
 expect "replay the mailed link" 404 "$(code "$URL")"
 
+# ── a duplicate address is lldap's constraint, mapped to a status ────────
+# Real lldap, real constraint: it answers a GraphQL error carrying
+# "UNIQUE constraint failed: users.lowercase_email", which reached an operator
+# as an uncaught 500 on the box before this was handled.
+BEFORE_ROWS=$(sql "SELECT COUNT(*) || ':' || SUM(state='approved') FROM intake")
+expect "a second account for one address is 409" 409 \
+  "$(admin_code -X POST "http://127.0.0.1:$MINT_PORT/invites" \
+      -H 'Content-Type: application/json' \
+      -d '{"username":"dadtwo","email":"dad@example.com","ttl_seconds":3600}')"
+expect "the intake table did not move" "$BEFORE_ROWS" \
+  "$(sql "SELECT COUNT(*) || ':' || SUM(state='approved') FROM intake")"
+
 # ── a GET flood must not spend the endpoint, and must not spend a nonce ──
 admin -X POST "http://127.0.0.1:$MINT_PORT/invites" \
   -H 'Content-Type: application/json' \

@@ -38,6 +38,10 @@ INTAKE_DB = os.environ.get(
 INTAKE_CAP = int(os.environ.get("PORTERO_INTAKE_CAP", "200"))
 
 USERNAME_RE = re.compile(r"^[a-z][a-z0-9_-]{2,31}$")
+# lldap owns the uniqueness of an address, enforced by a database constraint.
+# The constraint is the arbiter rather than a SELECT here, because a pre-check
+# plus an insert is the read-then-write pattern this estate has been bitten by.
+EMAIL_TAKEN = "UNIQUE constraint failed: users.lowercase_email"
 EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
 # Groups this endpoint is permitted to grant. An allowlist, not a pattern:
@@ -194,12 +198,18 @@ def provision(username, email, display_name, ttl, groups):
         group_ids[g] = gid
 
     # No password field. The account exists and cannot be used.
-    gql(
-        token,
-        "mutation($u:CreateUserInput!){createUser(user:$u){id}}",
-        {"u": {"id": username, "email": email,
-               "displayName": display_name or username}},
-    )
+    try:
+        gql(
+            token,
+            "mutation($u:CreateUserInput!){createUser(user:$u){id}}",
+            {"u": {"id": username, "email": email,
+                   "displayName": display_name or username}},
+        )
+    except RuntimeError as exc:
+        if EMAIL_TAKEN not in str(exc):
+            raise
+        log.info("refused %s: the address already belongs to an account", username)
+        return {"error": "that email address already belongs to an account"}, 409
 
     # Granting site access at mint time is safe BECAUSE the account has no
     # credential, and it dodges Authelia's profile-refresh window: the invitee's

@@ -46,12 +46,21 @@ class Base(unittest.TestCase):
         self.created = []
         self.added = []
         self.existing = set()
+        self.taken_emails = set()
 
         M.lldap_token = lambda: "fake-token"
 
         def fake_gql(token, query, variables=None, tolerate=()):
             variables = variables or {}
             if "createUser" in query:
+                if variables["u"].get("email") in self.taken_emails:
+                    # lldap's own words, read off spain on 2026-10-07 after an
+                    # approval for an address that already had an account.
+                    raise RuntimeError(
+                        "graphql error: [{'message': 'Database error: `Execution "
+                        "Error: error returned from database: (code: 2067) UNIQUE "
+                        "constraint failed: users.lowercase_email`'}]"
+                    )
                 self.created.append(variables["u"])
                 self.existing.add(variables["u"]["id"])
                 return {"createUser": {"id": variables["u"]["id"]}}
@@ -551,6 +560,62 @@ class MintLogging(IntakeBase):
         self.assertNotIn(url, blob)
         self.assertNotIn(url.rsplit("/i/", 1)[1], blob)
         self.assertIn("smtp refused", blob)
+
+
+class DuplicateEmail(IntakeBase):
+    """An address that already belongs to an account is a 409, never a 500.
+
+    lldap enforces uniqueness on lowercase_email with a database constraint, so
+    the constraint is the arbiter and this maps its one error to a status. A
+    pre-check followed by an insert would be the read-then-write pattern that
+    has bitten this estate three times.
+    """
+
+    def test_mint_answers_409_not_500(self):
+        self.taken_emails.add("dad@example.com")
+        r = self.post(self.good(email="dad@example.com"))
+        self.assertEqual(r.status_code, 409)
+        self.assertIn(b"already belongs", r.data)
+        self.assertEqual(self.created, [])
+
+    def test_approve_answers_409_and_RELEASES_the_row(self):
+        # The property worth protecting: a refused approval leaves the row
+        # retryable rather than stranded in approved with no account.
+        rid = self.row("dad@example.com")
+        self.taken_emails.add("dad@example.com")
+        r = self.call(f"/intake/{rid}/approve", {"username": "dad"})
+        self.assertEqual(r.status_code, 409)
+        row = self.admin.get(rid)
+        self.assertEqual(row["state"], "pending")
+        self.assertIsNone(row["username"])
+        self.assertIsNone(row["decided_by"])
+        self.assertEqual(self.mailed, [], "nothing may be mailed on a refusal")
+
+    def test_a_released_row_can_be_approved_afterwards(self):
+        rid = self.row("dad@example.com")
+        self.taken_emails.add("dad@example.com")
+        self.call(f"/intake/{rid}/approve", {"username": "dad"})
+        self.taken_emails.clear()
+        again = self.call(f"/intake/{rid}/approve", {"username": "dad"})
+        self.assertEqual(again.status_code, 201)
+        self.assertEqual(self.admin.get(rid)["state"], "approved")
+        self.assertEqual(len(self.mailed), 1)
+
+    def test_any_other_graphql_error_still_raises(self):
+        # The tolerance is one constraint, not "errors from createUser".
+        rid = self.row("dad@example.com")
+        real = M.gql
+
+        def angry(token, query, variables=None, tolerate=()):
+            if "createUser" in query:
+                raise RuntimeError("graphql error: [{'message': 'Unauthorized'}]")
+            return real(token, query, variables, tolerate)
+
+        M.gql = angry
+        with self.assertRaises(RuntimeError):
+            self.call(f"/intake/{rid}/approve", {"username": "dad"})
+        self.assertEqual(self.admin.get(rid)["state"], "pending",
+                         "a crash must still release the row")
 
 
 if __name__ == "__main__":
