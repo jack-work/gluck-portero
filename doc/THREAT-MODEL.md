@@ -45,7 +45,7 @@ default**, and it makes the ordering a property rather than a rule someone keeps
 | can create a user | yes | **no** | **no** |
 | can change a group | yes, allowlist only | **no** | **no** |
 | can send mail | yes | **no** | **no** |
-| state | the intake table, read and write | spent nonces only | the intake table, **INSERT only** |
+| state | the intake table, in its **own StateDirectory** | spent nonces only | one append-only spool, opened **write-only** |
 
 The intake unit is the only process here that starts with no credentials
 directory. It is checked rather than asserted: the packaging check imports its
@@ -147,41 +147,82 @@ improve for bad reasons. The property tested is the one that matters: after 300
 GETs on a link, the POST that redeems it still returns 200 and the account can
 log in afterwards.
 
-## The intake table, and writing where you cannot read
+## The spool, and writing where you cannot read
 
 Intake exists because inviting 20 people one at a time by hand does not scale,
 and because an unauthenticated endpoint that *decides* anything is a much worse
 shape than one that records.
 
-So the public unit records. One route, one INSERT, no statement in its module
-that reads a row back, and no route that returns stored data. Deciding happens
-on the authenticated half.
+So the public unit records, into one file it cannot read. The first version of
+this was a sqlite table shared with mint through a group, and two things were
+wrong with it. The public half could read the table back, and only code review
+said it did not. And sqlite's files were owned by whichever dynamic uid created
+them, which `systemd.exec` names as the hazard of writing outside a
+StateDirectory: "care must be taken so that UID/GID recycling does not create
+security issues involving files created by the service." DynamicUser uids are
+allocated per boot and reused, so a reboot could have handed an unrelated
+service ownership of the queue.
 
-| property | how |
+| property | how, and who enforces it |
 |---|---|
-| one response | accepted, duplicate, malformed, flooded and full all render the same bytes with the same status after the same floor |
+| cannot read back | the spool is opened `O_WRONLY \| O_APPEND` and no other descriptor on it is held, so a read returns **EBADF**. The **kernel** enforces this, not this document |
+| no ownership drift | the file is pre-created root-owned by tmpfiles, and neither service may create, rename or unlink it. `ReadWritePaths` names the **file**, so the public half cannot make or destroy anything in that directory |
+| the table is safe across a reboot | it lives in mint's own StateDirectory, which systemd re-chowns recursively at every start. That is the documented protection, applied rather than reimplemented |
+| one response | accepted, duplicate, malformed, flooded and full render the same bytes with the same status after the same floor |
 | never auto-sends | the unit holds no mail credential and does not import the mailer. The packaging check refuses a build where it does |
-| bounded | a sqlite trigger refuses an INSERT past `intakeCap` pending rows, so the cap holds for a caller that ignores exceptions |
-| no enumeration | there is no read path to enumerate with. A duplicate is swallowed, so the endpoint is not an oracle for which addresses are already known |
+| bounded | the writer refuses past `intakeSpoolMax` by calling `fstat` on **its own descriptor**, which is a size and not a read, so blindness survives the cap |
 | no address in a log | the journal records that an offer was written or dropped, never what was in it |
 
-The cap is a denial-of-service trade, stated plainly: an attacker can fill 200
-pending rows with junk and real requests are then dropped silently. The
-alternative, dropping the cap, is an attacker filling the disk of the machine
-that routes the house. The mint listing reports `pending_capacity` and the
-counts beside it so a full table is visible to the operator, and rejecting junk
-frees the slots.
+### Why nothing truncates the spool
 
-### The trust boundary the table crosses
+The consumer reads to a byte offset stored beside its own table and never writes
+to the spool at all. A truncate from the consumer would destroy any record
+appended between the read and the truncate, and that is a lost signup the
+submitter cannot detect, because he received the same indistinguishable 202 as
+everyone else. Losing a signup is worse than the ownership drift this design
+exists to fix.
 
-mint reads a table the public unit can write. That is a new edge, and the naive
-version of it is an escalation: write a row with `state = approved`, `username =
-admin` and an attacker's address, then wait for an operator to click send.
+Every automated rotation considered had the same defect in a different place: a
+rename orphans the writer's `O_APPEND` descriptor, which keeps appending to an
+unlinked inode, and the rows vanish. So there is no rotation. The cap is 1 MiB,
+roughly 3500 submissions, `GET /intake` reports `spool_bytes` against
+`spool_max` so a full spool is visible before it matters, and reclaiming it is a
+root-side chore with both units stopped inside a window this estate already
+takes.
 
-So a decided row carries an HMAC over `(id, email, username, nonce,
-expires_at)` under the invite signing key, which only the authenticated halves
-hold. `POST /intake/<id>/send` verifies it before mailing anything and refuses a
-row that fails, whether it was edited or forged whole.
+Ingestion is **at-least-once**, and the table's `UNIQUE(email)` makes it
+exactly-once: a crash between the INSERT and the offset write re-reads the
+records and the duplicates are refused by the constraint. The same move as
+letting lldap's own constraint arbitrate a duplicate address: the database holds
+the invariant and the code stops trying to.
+
+Only data up to the last complete newline is consumed, so a torn append waits
+for its remainder instead of being half-parsed. A single small append to a
+regular file will not tear in practice, and "in practice" is not a guarantee
+worth taking under a public endpoint.
+
+### The cap must be indistinguishable too
+
+Refusing a full spool is an `fstat` and no write, which is a strictly **cheaper**
+path than an accepted append. So byte-equality is not enough: the response floor
+is measured in the tests rather than trusted because it appears in the source.
+Accepted, duplicate, malformed, flooded and full are identical in bytes and none
+is measurably faster.
+
+### The decision MAC, and the boundary it used to cross
+
+When mint read a table the public unit could write, the naive version was an
+escalation: write a row with `state = approved`, `username = admin` and an
+attacker's address, then wait for an operator to click send. A decided row
+therefore carries an HMAC over `(id, email, username, nonce, expires_at)` under
+the invite signing key, verified by `POST /intake/<id>/send` before anything is
+mailed.
+
+**That boundary no longer exists.** The table is mint's alone and the public half
+cannot open it. The MAC is kept because it costs nothing and still catches
+corruption of mint's own state, and because a future author who re-shares the
+table would otherwise reintroduce the hole silently. It is no longer a defence
+against the public unit, and this file should not claim it is.
 
 The row stores the **nonce**, not the token. mint re-signs the nonce to rebuild
 the one live link, so a resend cannot create a second valid link for one
@@ -265,8 +306,8 @@ which is why it is written here and in the deploy notes rather than remembered.
 | `lldap_password_manager` credential disclosure | same delivery | holder can change passwords of directory users. Serious, and the reason this is not `lldap_admin` |
 | invite link forwarded or intercepted | single use, short expiry, no-referrer, never logged | whoever opens it first sets the password. The operator must send it over a channel he trusts |
 | denial of service on the public endpoints | global flood ceilings per method, a per-invite budget, `MemoryMax`, `CPUQuota` | a flood costs refusals. It can no longer consume a real invitee's attempt, because a GET spends neither the POST budget nor the nonce |
-| intake filled with junk | `intakeCap`, one response so the attacker learns nothing, counts visible to the operator | real signups are dropped silently while the table is full. Rejecting junk frees the slots |
-| the intake table is writable by a public unit | decision MAC over the fields that decide where a link goes, verified before any send | a holder can add noise to the operator's queue and nothing else. It cannot cause a link to be mailed anywhere |
+| the spool filled with junk | `intakeSpoolMax`, one response so the attacker learns nothing, `spool_bytes` visible to the operator | real signups are dropped silently once it is full, and reclaiming it needs a root-side truncate. The flood budget makes filling 1 MiB slow rather than impossible |
+| the spool is appendable by a public unit | it is append-only and write-only, the table is unreachable from that unit, and the file cannot be renamed or unlinked by it | a holder can add noise to the operator's queue. It cannot read the queue, cannot decide anything, and cannot cause a link to be mailed |
 | SES SMTP credential disclosure | sops, `LoadCredential` as a file, held by the authenticated half only | holder can send mail as `auth@kelliher.info`. Rotate in SES. It grants nothing in the directory |
 | guest reaches other hostnames | **not solved here.** Requires zero-by-default | this is the gating dependency. No invite is minted before `site-files-access` exists |
 
@@ -280,7 +321,8 @@ it, and each needs its revocation written down rather than assumed:
 
 | artifact | what a rollback does | the revocation |
 |---|---|---|
-| `/var/lib/gluck-portero-intake/intake.db` | nothing. The rows and the addresses in them survive | `rm -rf /var/lib/gluck-portero-intake`. The unit recreates an empty table |
+| `/var/lib/gluck-portero-intake/spool.jsonl` | nothing. The addresses appended to it survive | truncate it with both units stopped. tmpfiles recreates it root-owned if removed |
+| mint's `intake.db`, in its StateDirectory | nothing. Rows and decisions survive | `rm` it with mint stopped. The offset file beside it must go in the same breath |
 | a spent nonce | nothing. The INSERT already happened, so a redeemed link stays dead | none needed, and none wanted |
 | an account created by an approval, with its group | nothing. The user and the grant remain | `DELETE /invites/<username>` on the mint half, which deletes the account |
 

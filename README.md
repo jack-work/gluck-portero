@@ -9,7 +9,7 @@ Three halves, deliberately three processes:
 |---|---|
 | `portero.kelliher.info` | **Mint.** Behind Authelia, needs `portero-admin`. Creates the account, returns one link, and mails it through SES. |
 | `invite.kelliher.info` | **Redeem.** Public, unauthenticated. The invitee chooses his own password. |
-| `invite.kelliher.info/intake` | **Intake.** Public, unauthenticated, and holds no credential at all. It writes an address into a capped table it cannot read back. |
+| `invite.kelliher.info/intake` | **Intake.** Public, unauthenticated, holds no credential at all, and appends an address to a spool it **cannot read**: the descriptor is `O_WRONLY \| O_APPEND`, so a read returns `EBADF`. |
 
 Read [`doc/THREAT-MODEL.md`](./doc/THREAT-MODEL.md) before changing any route,
 credential or group. It contains the only public unauthenticated endpoint on this
@@ -113,16 +113,30 @@ guest before any rollback past the enforcement change.
 |---|---|
 | mint | `127.0.0.1:9101`, reads and writes the intake table |
 | redeem | `127.0.0.1:9102`, one sqlite table of spent nonces |
-| intake | `127.0.0.1:9103`, INSERT into the intake table and nothing else |
+| intake | `127.0.0.1:9103`, one append to a write-only spool and nothing else |
 
-The intake table lives in `/var/lib/gluck-portero-intake`, shared through the
-`portero-intake` group and nothing else. The group is **not** named after the
-unit: systemd allocates a `DynamicUser` named after the unit and refuses to
-start if a static user or group already holds that name, which is a `217/USER`
-exit with "User or group with specified name already exists".
+The queue is two files in two places, deliberately. The **spool** lives at
+`/var/lib/gluck-portero-intake/spool.jsonl`, pre-created root-owned by tmpfiles
+and reachable through the `portero-intake` group; the public half can append to
+that file and can neither read it nor create, rename or unlink anything beside
+it. The **table** lives in mint's own StateDirectory, which systemd re-chowns at
+every start, so a reboot that reassigns dynamic uids cannot leave it owned by a
+stranger.
 
-The directory is **state outside the closure**: a rollback does not remove it,
-and the revocation is one `rm -rf /var/lib/gluck-portero-intake`.
+Nothing truncates the spool. mint consumes it by byte offset, because a truncate
+from the consumer would destroy any record appended between the read and the
+truncate, and that is a lost signup the submitter cannot detect. The cap is
+1 MiB, about 3500 submissions, and `GET /intake` reports `spool_bytes` against
+`spool_max` so a full spool is visible before it matters. Reclaiming it is a
+root-side truncate with both units stopped.
+
+The group is **not** named after the unit: systemd allocates a `DynamicUser`
+named after the unit and refuses to start if a static user or group already
+holds that name, which is a `217/USER` exit with "User or group with specified
+name already exists".
+
+Both files are **state outside the closure**: a rollback removes neither, and the
+revocations are in `doc/THREAT-MODEL.md`.
 
 All three loopback; only Caddy reaches them. Intake is served under `/intake` on
 the redeem hostname rather than a name of its own, so there is no DNS record to
@@ -156,21 +170,22 @@ file, because that is the mistake that quietly undoes the split.
 
 ## Tests
 
-`nix flake check` runs seven suites, two whole-system tests and a packaging
-check: 11 checks, 100 cases.
+`nix flake check` runs eight suites, two whole-system tests and a packaging
+check: 12 checks.
 
 | suite | what it pins |
 |---|---|
 | `invites` | a token we did not sign is never interpreted; tampering, signature swaps, expiry, unsigned payloads; re-signing a nonce rebuilds exactly one token |
 | `spent` | single use comes from a primary key, not a read-then-write |
 | `budget` | a key spends only its own allowance; the window slides; memory is bounded when the key space is not |
-| `pending` | the cap is a schema trigger, not application politeness; approval has one winner; a row edited behind mint's back fails its MAC |
+| `spool` | a read on the writer's descriptor is `EBADF`; an append landing between a read and the offset advance is not lost; a torn line is neither dropped nor half-parsed |
+| `pending` | the cap is a schema trigger, not application politeness; approval has one winner; ingestion is exactly-once through `UNIQUE(email)` |
 | `redeem` | invalid, expired and used are byte-identical; the link works once; a typo does not burn it; a GET flood spends neither the POST budget nor the nonce; the token never reaches a log |
 | `mint` | `lldap_admin` cannot be granted; a caller without the group gets 403; a GraphQL error carrying HTTP 200 is not success; a rewritten intake row is never mailed |
-| `intake` | accepted, duplicate, malformed, flooded and full render identical bytes; no route returns a row; the address reaches no log |
+| `intake` | accepted, duplicate, malformed, flooded and full render identical bytes **and none is measurably faster**; no route returns a row; the address reaches no log |
 | `integration` | the original loop against a real lldap: zero credential, single use |
 | `pipeline` | intake to mail to redemption against a real lldap **and a real SMTP server**, with the intake unit started with no credentials directory |
-| `packaging` | both entrypoints import out of the derivation the units execute, and neither public half imports the mailer |
+| `packaging` | all three entrypoints import out of the derivation the units execute, the public half's spool descriptor is unreadable in the **shipped** tree, and neither public half imports the mailer or sqlite |
 
 `./negative-controls.sh` is the suite that tests the tests: it breaks nine
 properties one at a time and requires the named check to fail. One case is the
