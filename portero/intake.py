@@ -32,6 +32,7 @@ SPOOL_PATH = os.environ.get(
     "PORTERO_INTAKE_SPOOL", "/var/lib/gluck-portero-intake/spool.jsonl"
 )
 SPOOL_MAX = int(os.environ.get("PORTERO_INTAKE_SPOOL_MAX", str(1 << 20)))
+RECORD_MAX = int(os.environ.get("PORTERO_INTAKE_RECORD_MAX", str(spool.RECORD_MAX)))
 FLOOR_SECONDS = float(os.environ.get("PORTERO_RESPONSE_FLOOR", "0.35"))
 MAX_EMAIL = 254
 MAX_NOTE = 280
@@ -57,7 +58,7 @@ LEVELS = {
     FLOODED: logging.WARNING,
     MALFORMED: logging.INFO,
 }
-STORE = Spool(SPOOL_PATH, SPOOL_MAX)
+STORE = Spool(SPOOL_PATH, SPOOL_MAX, RECORD_MAX)
 
 PAGE = """<!doctype html><meta charset=utf-8>
 <meta name=viewport content="width=device-width,initial-scale=1">

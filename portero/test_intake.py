@@ -109,6 +109,15 @@ class OneResponse(Base):
         self.assertEqual([r["note"] for r in self.rows()],
                          [("un mot en français, " * 10).strip()])
 
+    def test_the_largest_legitimate_record_is_under_the_module_floor(self):
+        # The module refuses intakeRecordMax below 2200. If MAX_EMAIL or
+        # MAX_NOTE grows, this fails and the floor in flake.nix must follow.
+        email = "\U0001F600" * (I.MAX_EMAIL - 6) + "@x.com"
+        self.offer(email, "\U0001F600" * I.MAX_NOTE)
+        size = os.path.getsize(_SPOOL)
+        self.assertGreater(size, 2000, "the worst case did not reach the spool")
+        self.assertLessEqual(size, 2200)
+
     def test_the_address_is_lowercased(self):
         self.offer("Dad@Example.COM")
         self.assertEqual(self.rows()[0]["email"], "dad@example.com")
@@ -261,6 +270,18 @@ class Journal(Base):
         self.assertEqual(self.last(),
                          f"<4>WARNING intake offer outcome=oversize "
                          f"spool_bytes={self.size()} spool_max={1 << 20}")
+
+    def test_a_lowered_record_cap_declines_through_the_app(self):
+        I.STORE.record_max = 40
+        try:
+            response = self.offer("dad@example.com")
+        finally:
+            I.STORE.record_max = I.RECORD_MAX
+        self.assertEqual(response.status_code, 202)
+        self.assertEqual(self.last(),
+                         f"<4>WARNING intake offer outcome=oversize "
+                         f"spool_bytes={self.size()} spool_max={1 << 20}")
+        self.assertEqual(self.size(), 0)
 
     def test_one_line_per_post_and_never_an_address(self):
         posts = ["private-person@example.com", "not-an-email",
