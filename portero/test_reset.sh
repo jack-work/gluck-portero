@@ -10,14 +10,15 @@ ROOT=$(mktemp -d)
 trap 'rm -rf "$ROOT"' EXIT
 
 printf '#!%s\necho "$*" >> "$CALLS"\n' "$(command -v bash)" > "$ROOT/systemctl"
-chmod +x "$ROOT/systemctl"
+printf '#!%s\necho "chattr $*" >> "$CALLS"\n' "$(command -v bash)" > "$ROOT/chattr"
+chmod +x "$ROOT/systemctl" "$ROOT/chattr"
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
 say() { printf '  %-52s %s\n' "$1" "OK"; }
 
 echo "the reset, against its own contract:"
 
-export CALLS="$ROOT/calls" SYSTEMCTL="$ROOT/systemctl"
+export CALLS="$ROOT/calls" SYSTEMCTL="$ROOT/systemctl" CHATTR="$ROOT/chattr"
 export PORTERO_SPOOL="$ROOT/spool.jsonl" PORTERO_OFFSET="$ROOT/spool.offset"
 printf '{"email":"a@x.com"}\n{"email":"b@x.com"}\n' > "$PORTERO_SPOOL"
 printf '42' > "$PORTERO_OFFSET"
@@ -35,9 +36,12 @@ say "the reset line matches the netmon contract verbatim"
 
 expected="stop gluck-portero-intake.service
 stop gluck-portero-mint.service
+chattr -a -- $PORTERO_SPOOL
+chattr +a -- $PORTERO_SPOOL
+chattr +a -- $PORTERO_SPOOL
 start gluck-portero-mint.service gluck-portero-intake.service"
 [ "$(cat "$CALLS")" = "$expected" ] || fail "wrong order: $(tr '\n' '|' < "$CALLS")"
-say "writer stopped first, both started last"
+say "writer stopped, append-only lifted, restored, then both started"
 
 # The failure path. A directory where the spool should be makes truncate fail,
 # and the units must still come back.
@@ -48,9 +52,10 @@ if bash "$SCRIPT" > "$ROOT/out" 2>&1; then
   fail "a reset that could not truncate reported success"
 fi
 say "a failed truncate fails the unit"
-tail -1 "$CALLS" | grep -qx "start gluck-portero-mint.service gluck-portero-intake.service" \
-  || fail "units left stopped after a failed reset: $(tr '\n' '|' < "$CALLS")"
-say "and both units are started anyway"
+[ "$(tail -2 "$CALLS")" = "chattr +a -- $PORTERO_SPOOL
+start gluck-portero-mint.service gluck-portero-intake.service" ] \
+  || fail "append-only not restored before the units came back: $(tr '\n' '|' < "$CALLS")"
+say "append-only restored, then both units started anyway"
 
 echo
 echo "one run stops, empties, removes and restarts, and restarts on failure."

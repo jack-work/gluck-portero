@@ -32,6 +32,7 @@
           cfg = config.services.gluck-portero;
           setPasswordBin = "${pkgs.lldap}/bin/lldap_set_password";
           intakeGroup = "portero-intake";
+          readerGroup = "portero-spool-reader";
           spoolFile = "${cfg.intakeDirectory}/spool.jsonl";
           offsetFile = "/var/lib/gluck-portero-mint/spool.offset";
           py = pkgs.python3.withPackages (ps: with ps; [ flask waitress ]);
@@ -303,7 +304,7 @@
                   "admin_password:${cfg.adminPasswordFile}"
                 ] ++ lib.optional (cfg.smtpPasswordFile != null)
                   "smtp_password:${cfg.smtpPasswordFile}";
-                SupplementaryGroups = [ intakeGroup ];
+                SupplementaryGroups = [ readerGroup ];
                 MemoryMax = "192M";
                 CPUQuota = "40%";
               };
@@ -351,13 +352,16 @@
 
             {
               users.groups.${intakeGroup} = { };
+              users.groups.${readerGroup} = { };
 
               # Both pre-created ROOT-OWNED, and neither service may create or
               # remove them, so no dynamic user ever owns either one. A uid
               # reassigned after a reboot therefore inherits nothing.
               systemd.tmpfiles.rules = [
-                "d ${cfg.intakeDirectory} 0750 root ${intakeGroup} -"
-                "f ${spoolFile} 0660 root ${intakeGroup} -"
+                "d ${cfg.intakeDirectory} 0711 root root -"
+                "f ${spoolFile} 0660 root ${readerGroup} -"
+                "a+ ${spoolFile} - - - - group::r--,group:${intakeGroup}:-w-"
+                "h ${spoolFile} - - - - +a"
               ];
 
               systemd.services.gluck-portero-intake = {
@@ -395,7 +399,7 @@
                   PORTERO_OFFSET = offsetFile;
                   SYSTEMCTL = "${pkgs.systemd}/bin/systemctl";
                 };
-                path = [ pkgs.coreutils ];
+                path = [ pkgs.coreutils pkgs.e2fsprogs ];
                 serviceConfig = {
                   Type = "oneshot";
                   ExecStart = "${pkgs.bash}/bin/bash ${./portero/reset-intake.sh}";
@@ -622,6 +626,12 @@
             done
             echo "neither public half can send mail" | tee -a $out
           '';
+        } // nixpkgs.lib.optionalAttrs (system == "x86_64-linux") {
+          sandbox = import ./tests/spool-sandbox.nix {
+            inherit pkgs;
+            module = nixosModule;
+            probe = ./portero/probe_spool.py;
+          };
         });
     };
 }
