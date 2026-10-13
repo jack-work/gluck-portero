@@ -252,6 +252,7 @@
               pythonPackages = ps: with ps; [ flask waitress requests ];
               stateDirectory = "gluck-portero-mint";
               environment = {
+                PORTERO_LISTEN = "socket";
                 PORTERO_ADMIN_USER = cfg.adminUser;
                 PORTERO_REQUIRED_GROUP = cfg.requiredGroup;
                 PORTERO_GRANTABLE_GROUPS = lib.concatStringsSep "," cfg.grantableGroups;
@@ -280,6 +281,13 @@
                 CPUQuota = "40%";
               };
             })
+
+            {
+              services.kelliher-web.sites.gluck-portero-mint = {
+                proxyTo = lib.mkForce null;
+                proxySocket = "gluck-portero-mint.service";
+              };
+            }
 
             (gluck-service-lib.lib.mkPythonService {
               inherit config lib pkgs;
@@ -428,6 +436,15 @@
           budget = suite "budget" "test_budget.py";
           pending = suite "pending" "test_pending.py";
           intake = suite "intake" "test_intake.py";
+
+          # mint as SHIPPED, under systemd-socket-activate, the mechanism the
+          # platform socket uses.
+          socket = pkgs.runCommand "portero-socket" { } ''
+            set -o pipefail
+            export PORTERO_SRC=${porteroSrc pkgs}
+            export SOCKET_ACTIVATE=${pkgs.systemd}/bin/systemd-socket-activate
+            ${py}/bin/python3 ${./portero/test_socket.py} 2>&1 | tee $out
+          '';
 
           # The loop against a REAL lldap. No mocks, because mocks lied twice:
           # one returned {"user": None} where lldap raises a GraphQL error, and

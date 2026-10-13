@@ -14,6 +14,7 @@ token carries its own signed claim.
 import logging
 import os
 import re
+import socket
 import sys
 import threading
 import time
@@ -421,11 +422,23 @@ def send_intake(row_id):
 
 
 
+def inherited_sockets():
+    if os.environ.get("LISTEN_PID") != str(os.getpid()):
+        return []
+    return [socket.socket(fileno=3 + i) for i in range(int(os.environ.get("LISTEN_FDS", "0")))]
+
+
 def main():
     logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
     from waitress import serve
-    port = int(os.environ.get("PORT", "9101"))
-    serve(app, host="127.0.0.1", port=port, threads=4, ident=None)
+    sockets = inherited_sockets()
+    if sockets:
+        serve(app, sockets=sockets, threads=4, ident=None)
+    elif os.environ.get("PORTERO_LISTEN") == "socket":
+        sys.exit("no listening socket from systemd; refusing to fall back to TCP")
+    else:
+        port = int(os.environ.get("PORT", "9101"))
+        serve(app, host="127.0.0.1", port=port, threads=4, ident=None)
 
 
 if __name__ == "__main__":
