@@ -43,13 +43,16 @@ CREATE INDEX IF NOT EXISTS intake_state ON intake(state, id);
 STATES = ("pending", "approved", "rejected")
 
 
+TABLE_FULL = "intake is full"
+
+
 def cap_trigger(cap):
     return f"""
 DROP TRIGGER IF EXISTS intake_cap;
 CREATE TRIGGER intake_cap BEFORE INSERT ON intake
 WHEN (SELECT COUNT(*) FROM intake WHERE state = 'pending') >= {int(cap)}
 BEGIN
-  SELECT RAISE(ABORT, 'intake is full');
+  SELECT RAISE(ABORT, '{TABLE_FULL}');
 END;
 """
 
@@ -96,17 +99,22 @@ class IntakeAdmin:
         re-reads them and UNIQUE(email) refuses the duplicates. Nothing is ever
         written to the spool from here: no truncate, no rename, no unlink, so an
         append landing mid-ingest is simply next.
+
+        A full table stops ingestion at the refused record and leaves the offset
+        on it, so the submission waits in the spool until the operator frees a
+        slot. Swallowing that refusal like a duplicate would consume the record
+        and lose a real signup that nobody could see go.
         """
         if not self.spool_path or not self.offset_path:
             return 0
         start = self.offset()
         try:
-            records, end = spool.read_from(self.spool_path, start)
+            entries, end = spool.entries_from(self.spool_path, start)
         except OSError:
             return 0
         landed = 0
         with self._lock:
-            for row in records:
+            for row, begin, _ in entries:
                 try:
                     self._db.execute(
                         "INSERT INTO intake (email, note, received_at) VALUES (?,?,?)",
@@ -115,8 +123,10 @@ class IntakeAdmin:
                          int(row.get("at") or time.time())),
                     )
                     landed += 1
-                except sqlite3.IntegrityError:
-                    pass
+                except sqlite3.IntegrityError as exc:
+                    if TABLE_FULL in str(exc):
+                        end = begin
+                        break
         if end != start:
             tmp = self.offset_path + ".new"
             with open(tmp, "w", encoding="utf-8") as fh:

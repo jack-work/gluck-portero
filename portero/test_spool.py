@@ -38,7 +38,7 @@ class Blindness(unittest.TestCase):
         with open(os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                "spool.py"), encoding="utf-8") as fh:
             src = fh.read()
-        writer = src.split("class Spool")[1].split("def read_from")[0]
+        writer = src.split("class Spool")[1].split("def entries_from")[0]
         self.assertNotIn("O_RDWR", writer)
         self.assertNotIn("O_RDONLY", writer)
         self.assertNotIn("open(", writer.replace("os.open(", ""))
@@ -141,7 +141,7 @@ class Cap(unittest.TestCase):
     def test_an_oversize_record_is_declined_not_truncated(self):
         path, s = fresh()
         self.addCleanup(s.close)
-        s.offer("x@example.com", "n" * 4000)
+        s.offer("x@example.com", "n" * (spool.RECORD_MAX + 1))
         self.assertEqual(os.path.getsize(path), 0)
 
     def test_a_full_spool_does_not_corrupt_what_is_already_there(self):
@@ -155,6 +155,59 @@ class Cap(unittest.TestCase):
         for i in range(10):
             s.offer(f"rejected{i}@example.com")
         self.assertEqual(open(path, "rb").read(), kept)
+
+
+
+class Utf8(unittest.TestCase):
+    """A legitimate submission is never declined for its size.
+
+    The first version escaped non-ASCII as \\uXXXX, six bytes a character, so a
+    200-character note in French crossed RECORD_MAX and was silently declined.
+    """
+
+    def test_a_non_ascii_note_is_written_and_read_back_intact(self):
+        path, s = fresh()
+        self.addCleanup(s.close)
+        s.offer("dad@example.com", "é" * 200)
+        rows, _ = spool.read_from(path, 0)
+        self.assertEqual([r["note"] for r in rows], ["é" * 200])
+
+    def test_the_largest_legitimate_record_fits(self):
+        # intake admits 254 characters of address and 280 of note; four-byte
+        # characters are the worst case UTF-8 allows.
+        path, s = fresh()
+        self.addCleanup(s.close)
+        email = "😀" * 248 + "@x.com"
+        self.assertEqual(len(email), 254)
+        s.offer(email, "😀" * 280)
+        rows, _ = spool.read_from(path, 0)
+        self.assertEqual([r["email"] for r in rows], [email])
+
+
+class Positions(unittest.TestCase):
+    def test_entries_carry_byte_positions_a_consumer_can_resume_from(self):
+        path, s = fresh()
+        self.addCleanup(s.close)
+        for e in ("a@x.com", "b@x.com", "c@x.com"):
+            s.offer(e)
+        entries, end = spool.entries_from(path, 0)
+        self.assertEqual(entries[0][1], 0)
+        self.assertEqual(entries[-1][2], end)
+        for (_, _, prev_end), (_, begin, _) in zip(entries, entries[1:]):
+            self.assertEqual(prev_end, begin)
+        resumed, _ = spool.entries_from(path, entries[2][1])
+        self.assertEqual([r["email"] for r, _, _ in resumed], ["c@x.com"])
+
+    def test_a_non_object_line_is_skipped_rather_than_crashing_the_consumer(self):
+        path, s = fresh()
+        self.addCleanup(s.close)
+        s.offer("before@example.com")
+        with open(path, "ab") as fh:
+            fh.write(b"5\n")
+        s.offer("after@example.com")
+        rows, _ = spool.read_from(path, 0)
+        self.assertEqual([r["email"] for r in rows],
+                         ["before@example.com", "after@example.com"])
 
 
 if __name__ == "__main__":

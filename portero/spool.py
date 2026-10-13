@@ -16,7 +16,10 @@ import json
 import os
 import time
 
-RECORD_MAX = 1024
+# The largest record a legitimate submission can produce: intake admits an
+# address of 254 characters and a note of 280, and UTF-8 spends at most four
+# bytes on a character. The cap only has to refuse what intake would never send.
+RECORD_MAX = 4096
 
 
 class Spool:
@@ -35,7 +38,7 @@ class Spool:
         record = json.dumps(
             {"email": email, "note": note,
              "at": int(now if now is not None else time.time())},
-            separators=(",", ":"), sort_keys=True,
+            separators=(",", ":"), sort_keys=True, ensure_ascii=False,
         ).encode("utf-8") + b"\n"
         if len(record) > RECORD_MAX:
             return
@@ -50,8 +53,11 @@ class Spool:
         os.close(self._fd)
 
 
-def read_from(path, offset, limit=1 << 20):
-    """Consumer side. Returns (records, new_offset), never past a partial line.
+def entries_from(path, offset, limit=1 << 20):
+    """Consumer side. Returns (entries, new_offset), never past a partial line.
+
+    Each entry is (row, start, end) in bytes, so a consumer that cannot accept
+    a row yet can leave its offset at that row's start and take it next time.
 
     A short append would otherwise be parsed as a whole record. Only data up to
     the last newline is consumed, so a torn tail waits for the rest instead of
@@ -68,14 +74,22 @@ def read_from(path, offset, limit=1 << 20):
     cut = blob.rfind(b"\n")
     if cut < 0:
         return [], offset
-    records = []
+    entries = []
+    pos = offset
     for line in blob[:cut].split(b"\n"):
+        begin = pos
+        pos += len(line) + 1
         if not line:
             continue
         try:
             row = json.loads(line)
         except ValueError:
             continue
-        if isinstance(row.get("email"), str):
-            records.append(row)
-    return records, offset + cut + 1
+        if isinstance(row, dict) and isinstance(row.get("email"), str):
+            entries.append((row, begin, pos))
+    return entries, offset + cut + 1
+
+
+def read_from(path, offset, limit=1 << 20):
+    entries, end = entries_from(path, offset, limit)
+    return [row for row, _, _ in entries], end

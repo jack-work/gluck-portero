@@ -103,6 +103,11 @@ class OneResponse(Base):
         self.assertEqual(flooded.data, normal.data)
         self.assertEqual([x["email"] for x in self.rows()], ["first@example.com"])
 
+    def test_a_non_ascii_note_reaches_the_spool(self):
+        self.offer("dad@example.com", "un mot en français, " * 10)
+        self.assertEqual([r["note"] for r in self.rows()],
+                         [("un mot en français, " * 10).strip()])
+
     def test_the_address_is_lowercased(self):
         self.offer("Dad@Example.COM")
         self.assertEqual(self.rows()[0]["email"], "dad@example.com")

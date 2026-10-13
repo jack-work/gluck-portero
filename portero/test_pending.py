@@ -86,12 +86,19 @@ class Ingest(Base):
         self.assertNotIn("one-too-many@example.com", [r["email"] for r in rows])
 
     def test_cap_counts_only_pending_rows(self):
+        # setUp already holds one pending row, so the last of these waits.
+        # An earlier version of this test expected the NEXT submission to land
+        # after a reject, which was only true because the waiting one had been
+        # silently consumed and lost.
         for i in range(self.cap):
             self.offer(f"user{i}@example.com")
+        last = f"user{self.cap - 1}@example.com"
+        self.assertNotIn(last, [r["email"] for r in self.a.listing()])
         self.assertTrue(self.a.reject(1, "admin"))
         self.offer("now-there-is-room@example.com")
-        self.assertIn("now-there-is-room@example.com",
-                      [r["email"] for r in self.a.listing()])
+        emails = [r["email"] for r in self.a.listing()]
+        self.assertIn(last, emails, "the oldest waiting record takes the freed slot")
+        self.assertNotIn("now-there-is-room@example.com", emails)
 
     def setUp(self):
         super().setUp()
@@ -201,6 +208,57 @@ class Resign(unittest.TestCase):
         forged = invites.sign(b"z" * 48, "dad", expires, nonce)
         with self.assertRaises(invites.InvalidToken):
             invites.verify(KEY, forged)
+
+
+
+class FullTableDefers(Base):
+    """A full table is a queue, not a drain.
+
+    The first version swallowed the cap refusal together with duplicates and
+    advanced the offset past it, so a real signup arriving while 200 rows were
+    pending was consumed and lost, and freeing a slot did not bring it back.
+    """
+
+    def fill(self):
+        for i in range(self.cap):
+            self.offer(f"user{i}@example.com")
+
+    def test_the_refused_record_stays_in_the_spool(self):
+        self.fill()
+        self.w.offer("waiting@example.com")
+        self.assertEqual(self.a.ingest(), 0)
+        self.assertLess(self.a.offset(), os.path.getsize(self.spool_path))
+        self.assertNotIn("waiting@example.com",
+                         [r["email"] for r in self.a.listing(state=None)])
+
+    def test_it_lands_once_a_slot_frees(self):
+        self.fill()
+        self.w.offer("waiting@example.com")
+        self.a.ingest()
+        self.a.reject(self.a.listing()[0]["id"], "admin")
+        self.assertEqual(self.a.ingest(), 1)
+        self.assertIn("waiting@example.com",
+                      [r["email"] for r in self.a.listing(state=None)])
+        self.assertEqual(self.a.offset(), os.path.getsize(self.spool_path))
+
+    def test_records_behind_it_wait_in_order(self):
+        self.fill()
+        self.w.offer("first@example.com")
+        self.w.offer("second@example.com")
+        self.a.ingest()
+        self.a.reject(self.a.listing()[0]["id"], "admin")
+        self.a.ingest()
+        emails = [r["email"] for r in self.a.listing(state=None)]
+        self.assertIn("first@example.com", emails)
+        self.assertNotIn("second@example.com", emails,
+                         "one freed slot admits exactly one record")
+
+    def test_a_duplicate_still_advances_when_there_is_room(self):
+        self.offer("dad@example.com")
+        self.w.offer("dad@example.com")
+        self.w.offer("next@example.com")
+        self.assertEqual(self.a.ingest(), 1)
+        self.assertEqual(self.a.offset(), os.path.getsize(self.spool_path))
 
 
 if __name__ == "__main__":
