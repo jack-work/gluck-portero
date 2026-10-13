@@ -33,6 +33,7 @@
           setPasswordBin = "${pkgs.lldap}/bin/lldap_set_password";
           intakeGroup = "portero-intake";
           spoolFile = "${cfg.intakeDirectory}/spool.jsonl";
+          offsetFile = "/var/lib/gluck-portero-mint/spool.offset";
           py = pkgs.python3.withPackages (ps: with ps; [ flask waitress ]);
 
           # The entrypoints import sibling modules, so the package has to reach
@@ -180,10 +181,16 @@
                 which is a lost signup that the submitter cannot detect. mint
                 consumes by byte offset instead and never writes here.
 
-                At roughly 300 bytes a record this is about 3500 submissions.
-                Reclaiming it is a root-side chore with both units stopped, and
-                mint's GET /intake reports spool_bytes against spool_max so a
-                full spool is visible before it matters.
+                The largest record a caller can force is 2157 bytes, measured,
+                so 486 hostile submissions fill the default, about four minutes
+                at intake's flood ceiling. An ordinary signup is a few hundred
+                bytes. mint's GET /intake reports spool_bytes against spool_max.
+
+                Reclaiming it is `systemctl start gluck-portero-intake-reset` as
+                root, which stops both units, empties the spool, removes mint's
+                offset and starts both again, in one run. Emptying the spool
+                without removing the offset would leave mint skipping whatever
+                is appended until the file grows past the old offset.
               '';
             };
 
@@ -278,6 +285,7 @@
                 PORTERO_DEFAULT_TTL = toString cfg.defaultTtlSeconds;
                 PORTERO_MAX_TTL = toString cfg.maxTtlSeconds;
                 PORTERO_INTAKE_SPOOL = spoolFile;
+                PORTERO_INTAKE_OFFSET = offsetFile;
                 PORTERO_INTAKE_SPOOL_MAX = toString cfg.intakeSpoolMax;
                 PORTERO_INTAKE_CAP = toString cfg.intakeCap;
                 PORTERO_SMTP_HOST = cfg.smtpHost;
@@ -372,6 +380,20 @@
                 };
               };
 
+              systemd.services.gluck-portero-intake-reset = {
+                description = "gluck-portero: empty the intake spool and reset mint's offset, run by hand";
+                environment = {
+                  PORTERO_SPOOL = spoolFile;
+                  PORTERO_OFFSET = offsetFile;
+                  SYSTEMCTL = "${pkgs.systemd}/bin/systemctl";
+                };
+                path = [ pkgs.coreutils ];
+                serviceConfig = {
+                  Type = "oneshot";
+                  ExecStart = "${pkgs.bash}/bin/bash ${./portero/reset-intake.sh}";
+                };
+              };
+
               services.kelliher-web.sites.gluck-portero-mint.trustsRemoteHeaders = true;
 
               services.kelliher-web.sites.gluck-portero-redeem.extraConfig = ''
@@ -455,6 +477,13 @@
           mint = suite "mint" "test_mint.py";
           budget = suite "budget" "test_budget.py";
           spool = suite "spool" "test_spool.py";
+
+          reset = pkgs.runCommand "portero-reset"
+            { nativeBuildInputs = [ pkgs.bash pkgs.coreutils pkgs.gnugrep ]; } ''
+              set -o pipefail
+              export HOME=$TMPDIR
+              bash ${./portero/test_reset.sh} ${./portero/reset-intake.sh} 2>&1 | tee $out
+            '';
           pending = suite "pending" "test_pending.py";
           intake = suite "intake" "test_intake.py";
 
