@@ -185,10 +185,23 @@ exists to fix.
 Every automated rotation considered had the same defect in a different place: a
 rename orphans the writer's `O_APPEND` descriptor, which keeps appending to an
 unlinked inode, and the rows vanish. So there is no rotation. The cap is 1 MiB,
-roughly 3500 submissions, `GET /intake` reports `spool_bytes` against
-`spool_max` so a full spool is visible before it matters, and reclaiming it is a
-root-side chore with both units stopped inside a window this estate already
-takes.
+which a caller forcing 2157-byte records fills with 486 submissions, about four
+minutes at the flood ceiling. `GET /intake` reports `spool_bytes` against
+`spool_max`, and reclaiming it is `systemctl start gluck-portero-intake-reset`
+as root: one run that stops both units, empties the spool, removes mint's offset
+and starts both again. Emptying the spool without removing the offset is the
+half-reset this unit exists to prevent, because mint would skip whatever is
+appended until the file grew past the old offset.
+
+### A full table is a queue
+
+The table's cap of 200 pending rows is enforced by a trigger, and ingestion
+**stops** at the first record it refuses, leaving the offset on that record. The
+signup waits in the spool and lands, in order, when the operator frees a slot.
+The first version swallowed that refusal together with duplicates and advanced
+past it, which consumed and lost a real signup that nobody could see go; a test
+that expected the next submission to land after a reject was passing only
+because the one before it had been lost.
 
 Ingestion is **at-least-once**, and the table's `UNIQUE(email)` makes it
 exactly-once: a crash between the INSERT and the offset write re-reads the
@@ -306,7 +319,7 @@ which is why it is written here and in the deploy notes rather than remembered.
 | `lldap_password_manager` credential disclosure | same delivery | holder can change passwords of directory users. Serious, and the reason this is not `lldap_admin` |
 | invite link forwarded or intercepted | single use, short expiry, no-referrer, never logged | whoever opens it first sets the password. The operator must send it over a channel he trusts |
 | denial of service on the public endpoints | global flood ceilings per method, a per-invite budget, `MemoryMax`, `CPUQuota` | a flood costs refusals. It can no longer consume a real invitee's attempt, because a GET spends neither the POST budget nor the nonce |
-| the spool filled with junk | `intakeSpoolMax`, one response so the attacker learns nothing, `spool_bytes` visible to the operator | real signups are dropped silently once it is full, and reclaiming it needs a root-side truncate. The flood budget makes filling 1 MiB slow rather than impossible |
+| the spool filled with junk | `intakeSpoolMax`, one response so the attacker learns nothing, `spool_bytes` visible to the operator | real signups are declined silently once it is full, about four minutes of sustained abuse at the flood ceiling, and recovery needs root. Worse than the old table, which the operator could clear through the API. Spool fullness is not yet alerted on anywhere |
 | the spool is appendable by a public unit | it is append-only and write-only, the table is unreachable from that unit, and the file cannot be renamed or unlinked by it | a holder can add noise to the operator's queue. It cannot read the queue, cannot decide anything, and cannot cause a link to be mailed |
 | SES SMTP credential disclosure | sops, `LoadCredential` as a file, held by the authenticated half only | holder can send mail as `auth@kelliher.info`. Rotate in SES. It grants nothing in the directory |
 | guest reaches other hostnames | **not solved here.** Requires zero-by-default | this is the gating dependency. No invite is minted before `site-files-access` exists |
@@ -321,7 +334,7 @@ it, and each needs its revocation written down rather than assumed:
 
 | artifact | what a rollback does | the revocation |
 |---|---|---|
-| `/var/lib/gluck-portero-intake/spool.jsonl` | nothing. The addresses appended to it survive | truncate it with both units stopped. tmpfiles recreates it root-owned if removed |
+| `/var/lib/gluck-portero-intake/spool.jsonl` | nothing. The addresses appended to it survive | `systemctl start gluck-portero-intake-reset`. tmpfiles recreates it root-owned if removed |
 | mint's `intake.db`, in its StateDirectory | nothing. Rows and decisions survive | `rm` it with mint stopped. The offset file beside it must go in the same breath |
 | a spent nonce | nothing. The INSERT already happened, so a redeemed link stays dead | none needed, and none wanted |
 | an account created by an approval, with its group | nothing. The user and the grant remain | `DELETE /invites/<username>` on the mint half, which deletes the account |

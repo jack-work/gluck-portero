@@ -125,10 +125,23 @@ stranger.
 
 Nothing truncates the spool. mint consumes it by byte offset, because a truncate
 from the consumer would destroy any record appended between the read and the
-truncate, and that is a lost signup the submitter cannot detect. The cap is
-1 MiB, about 3500 submissions, and `GET /intake` reports `spool_bytes` against
-`spool_max` so a full spool is visible before it matters. Reclaiming it is a
-root-side truncate with both units stopped.
+truncate, and that is a lost signup the submitter cannot detect.
+
+Two caps, and they fail differently:
+
+| cap | when it is hit | recovery |
+|---|---|---|
+| 200 pending rows in mint's table | ingestion **stops at the refused record** and leaves it in the spool, so it lands in order once a row is approved or rejected | the operator, through the authenticated API |
+| 1 MiB of spool | intake declines every submission, with the same bytes and timing as an accepted one | root: `systemctl start gluck-portero-intake-reset` |
+
+A caller can force 2157-byte records, so 486 hostile submissions fill the
+spool, about four minutes at intake's flood ceiling. `GET /intake` reports
+`spool_bytes` against `spool_max`; nothing else on the estate shows it yet.
+
+The reset unit stops both units, empties the spool, removes mint's offset and
+starts both again, from a trap so they come back even if the reset fails. Do not
+empty the spool by hand: without the offset removed in the same run, mint skips
+whatever is appended until the file grows past the old offset.
 
 The group is **not** named after the unit: systemd allocates a `DynamicUser`
 named after the unit and refuses to start if a static user or group already
