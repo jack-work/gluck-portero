@@ -168,6 +168,17 @@
               '';
             };
 
+            intakeRecordMax = lib.mkOption {
+              type = lib.types.int;
+              default = 4096;
+              description = ''
+                Ceiling in BYTES on one spool record. intake declines a larger
+                one and logs outcome=oversize. It has a floor: the largest
+                legitimate record, a 254-character address and a 280-character
+                note at four bytes a character, measures 2157 bytes.
+              '';
+            };
+
             intakeSpoolMax = lib.mkOption {
               type = lib.types.int;
               default = 1048576;
@@ -377,6 +388,7 @@
                   PORT = toString cfg.intakePort;
                   PORTERO_INTAKE_SPOOL = spoolFile;
                   PORTERO_INTAKE_SPOOL_MAX = toString cfg.intakeSpoolMax;
+                  PORTERO_INTAKE_RECORD_MAX = toString cfg.intakeRecordMax;
                 };
                 serviceConfig = gluck-service-lib.lib.defaultHardened // {
                   DynamicUser = true;
@@ -439,6 +451,12 @@
                 {
                   assertion = cfg.minPasswordLength >= 10;
                   message = "gluck-portero: minPasswordLength below 10 is not acceptable.";
+                }
+                {
+                  assertion = cfg.intakeRecordMax >= 2200;
+                  message =
+                    "gluck-portero: intakeRecordMax below 2200 would decline legitimate "
+                    + "signups. The largest one a caller can send measures 2157 bytes.";
                 }
                 {
                   assertion = cfg.intakeCap >= 1;

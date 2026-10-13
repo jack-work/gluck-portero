@@ -31,9 +31,10 @@ ERROR = "error"
 class Spool:
     """Append-only, write-only. Its cap is a size, which is not a read."""
 
-    def __init__(self, path, max_bytes):
+    def __init__(self, path, max_bytes, record_max=RECORD_MAX):
         self.path = path
         self.max_bytes = int(max_bytes)
+        self.record_max = int(record_max)
         self._fd = os.open(path, os.O_WRONLY | os.O_APPEND)
 
     def size(self):
@@ -56,7 +57,7 @@ class Spool:
              "at": int(now if now is not None else time.time())},
             separators=(",", ":"), sort_keys=True, ensure_ascii=False,
         ).encode("utf-8") + b"\n"
-        if len(record) > RECORD_MAX:
+        if len(record) > self.record_max:
             return OVERSIZE, None
         try:
             if self.size() + len(record) > self.max_bytes:
