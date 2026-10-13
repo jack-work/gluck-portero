@@ -345,8 +345,12 @@
               ];
 
               systemd.services.gluck-portero-intake = {
-                description = "gluck-portero-intake: the public write-only signup table";
-                after = [ "network.target" "systemd-tmpfiles-setup.service" ];
+                description = "gluck-portero-intake: the public write-only signup spool";
+                after = [
+                  "network.target"
+                  "systemd-tmpfiles-setup.service"
+                  "systemd-tmpfiles-resetup.service"
+                ];
                 requires = [ "systemd-tmpfiles-setup.service" ];
                 wantedBy = [ "multi-user.target" ];
                 environment = {
