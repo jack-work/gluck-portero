@@ -4,7 +4,7 @@
 The properties this file defends, in order of how much they would cost:
 
   no row is lost when an append lands during a consumption
-  the writer cannot read, enforced by the kernel rather than by review
+  the writer opens append-only, which chattr +a on the real file requires
   a torn tail waits for the rest instead of being dropped or half-parsed
   the cap is a size, and declining looks identical to accepting
 """
@@ -23,10 +23,16 @@ def fresh(max_bytes=1 << 20):
     return path, spool.Spool(path, max_bytes)
 
 
-class Blindness(unittest.TestCase):
+class WriterDescriptor(unittest.TestCase):
+    """The writer's own descriptor is write-only and append-only.
+
+    This once stood as proof that the public half could not read the spool.
+    It never was: it proves the descriptor cannot read, while a process with
+    read permission can open another. What stops intake reading is the file's
+    permissions, which checks.sandbox tests inside the real unit.
+    """
+
     def test_the_writer_descriptor_cannot_be_read(self):
-        # The upgrade this design exists for: "the public half cannot read the
-        # table back" stops being a claim about code and becomes EBADF.
         path, s = fresh()
         self.addCleanup(s.close)
         s.offer("dad@example.com")

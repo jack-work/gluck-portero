@@ -45,7 +45,7 @@ default**, and it makes the ordering a property rather than a rule someone keeps
 | can create a user | yes | **no** | **no** |
 | can change a group | yes, allowlist only | **no** | **no** |
 | can send mail | yes | **no** | **no** |
-| state | the intake table, in its **own StateDirectory** | spent nonces only | one append-only spool, opened **write-only** |
+| state | the intake table, in its **own StateDirectory**; reads the spool | spent nonces only | appends to one append-only spool it has no read permission on |
 
 The intake unit is the only process here that starts with no credentials
 directory. It is checked rather than asserted: the packaging check imports its
@@ -153,7 +153,7 @@ Intake exists because inviting 20 people one at a time by hand does not scale,
 and because an unauthenticated endpoint that *decides* anything is a much worse
 shape than one that records.
 
-So the public unit records, into one file it cannot read. The first version of
+So the public unit records, into one file it can only append to. The first version of
 this was a sqlite table shared with mint through a group, and two things were
 wrong with it. The public half could read the table back, and only code review
 said it did not. And sqlite's files were owned by whichever dynamic uid created
@@ -165,13 +165,31 @@ service ownership of the queue.
 
 | property | how, and who enforces it |
 |---|---|
-| cannot read back | the spool is opened `O_WRONLY \| O_APPEND` and no other descriptor on it is held, so a read returns **EBADF**. The **kernel** enforces this, not this document |
+| cannot read back | the file's permissions. The spool is `root:portero-spool-reader`, owning group `r--`, which only mint holds, and an ACL entry gives `portero-intake` `-w-` and nothing more. Measured inside the real intake unit: `open(O_RDONLY)` is **EACCES** |
+| cannot truncate or overwrite | `chattr +a` from a tmpfiles `h` line. Inside the real unit: a write open without `O_APPEND` is **EPERM**, `ftruncate` is **EPERM**, and `pwrite` at offset zero appends instead of overwriting |
 | no ownership drift | the file is pre-created root-owned by tmpfiles, and neither service may create, rename or unlink it. `ReadWritePaths` names the **file**, so the public half cannot make or destroy anything in that directory |
 | the table is safe across a reboot | it lives in mint's own StateDirectory, which systemd re-chowns recursively at every start. That is the documented protection, applied rather than reimplemented |
 | one response | accepted, duplicate, malformed, flooded and full render the same bytes with the same status after the same floor |
 | never auto-sends | the unit holds no mail credential and does not import the mailer. The packaging check refuses a build where it does |
-| bounded | the writer refuses past `intakeSpoolMax` by calling `fstat` on **its own descriptor**, which is a size and not a read, so blindness survives the cap |
+| bounded | the writer refuses past `intakeSpoolMax` by calling `fstat` on **its own descriptor**, which is a size and not a read, so the cap needs no read permission |
 | no address in a log | the journal records that an offer was written or dropped, never what was in it |
+
+### The claim that was false, and why it looked tested
+
+The first version of this section said the public half could not read the
+spool and that the kernel enforced it, citing `EBADF` from intake's
+`O_WRONLY|O_APPEND` descriptor. El Inspector showed otherwise in a VM on
+spain's pin: intake's group owned a `0660` file, so the process could open a
+**second** descriptor and read every record, `ftruncate` the file to nothing,
+and `pwrite` over the first record.
+
+`EBADF` proved that one **descriptor** could not read. Whether the **process**
+can read is a question about its permissions on the file, and no check asked
+it: the probe tried creating and renaming files beside the spool, which the
+read-only directory blocks, and never a second `open`. A check that answers a
+narrower question than the claim it is cited for is the failure, and it is now
+covered by `checks.sandbox`, which first restores the old layout and requires
+the probe to succeed in reading before it is trusted to report a refusal.
 
 ### Why nothing truncates the spool
 
@@ -320,7 +338,7 @@ which is why it is written here and in the deploy notes rather than remembered.
 | invite link forwarded or intercepted | single use, short expiry, no-referrer, never logged | whoever opens it first sets the password. The operator must send it over a channel he trusts |
 | denial of service on the public endpoints | global flood ceilings per method, a per-invite budget, `MemoryMax`, `CPUQuota` | a flood costs refusals. It can no longer consume a real invitee's attempt, because a GET spends neither the POST budget nor the nonce |
 | the spool filled with junk | `intakeSpoolMax`, one response so the attacker learns nothing, `spool_bytes` visible to the operator | real signups are declined silently once it is full, about four minutes of sustained abuse at the flood ceiling, and recovery needs root. Worse than the old table, which the operator could clear through the API. Spool fullness is not yet alerted on anywhere |
-| the spool is appendable by a public unit | it is append-only and write-only, the table is unreachable from that unit, and the file cannot be renamed or unlinked by it | a holder can add noise to the operator's queue. It cannot read the queue, cannot decide anything, and cannot cause a link to be mailed |
+| the spool is appendable by a public unit | write-only through an ACL entry, append-only through `chattr +a`, the directory is not writable, and the table is unreachable from that unit | a holder can add noise to the operator's queue, including a partial line that spoils the next record. It cannot read, truncate, overwrite or remove the queue, cannot decide anything, and cannot cause a link to be mailed |
 | SES SMTP credential disclosure | sops, `LoadCredential` as a file, held by the authenticated half only | holder can send mail as `auth@kelliher.info`. Rotate in SES. It grants nothing in the directory |
 | guest reaches other hostnames | **not solved here.** Requires zero-by-default | this is the gating dependency. No invite is minted before `site-files-access` exists |
 

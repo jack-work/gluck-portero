@@ -183,10 +183,10 @@
               type = lib.types.int;
               default = 1048576;
               description = ''
-                Ceiling in BYTES on the write-only spool the public half appends
+                Ceiling in BYTES on the append-only spool the public half writes
                 to. The public half enforces it with fstat on its own
-                descriptor, which is a size and not a read, so its blindness
-                survives the cap.
+                descriptor, which is a size and not a read, so the cap needs
+                no read access to the spool.
 
                 Nothing truncates the spool: a truncate from the consumer would
                 destroy any record appended between the read and the truncate,
@@ -376,7 +376,7 @@
               ];
 
               systemd.services.gluck-portero-intake = {
-                description = "gluck-portero-intake: the public write-only signup spool";
+                description = "gluck-portero-intake: the public signup spool's only writer";
                 after = [
                   "network.target"
                   "systemd-tmpfiles-setup.service"
@@ -606,11 +606,13 @@
             import intake
             assert hasattr(intake, "offer"), "intake entrypoint incomplete"
             assert not hasattr(intake, "mailer"), "the public half imports a mailer"
-            # The claim upgrade, checked against the SHIPPED tree: the public
-            # half's handle on the spool cannot be read, by the kernel's rule.
+            # The shipped intake opens the spool write-only and append-only,
+            # which append-only (chattr +a) requires. This checks the
+            # descriptor only; whether the PROCESS can read is a matter of
+            # permissions, and checks.sandbox asks that inside the real unit.
             try:
                 os.read(intake.STORE._fd, 1)
-                raise AssertionError("the shipped intake half can READ its spool")
+                raise AssertionError("the shipped intake opened its spool readable")
             except OSError as exc:
                 assert exc.errno == 9, exc
             assert "sqlite3" not in sys.modules, "the public half opened sqlite"

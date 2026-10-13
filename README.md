@@ -9,7 +9,7 @@ Three halves, deliberately three processes:
 |---|---|
 | `portero.kelliher.info` | **Mint.** Behind Authelia, needs `portero-admin`. Creates the account, returns one link, and mails it through SES. |
 | `invite.kelliher.info` | **Redeem.** Public, unauthenticated. The invitee chooses his own password. |
-| `invite.kelliher.info/intake` | **Intake.** Public, unauthenticated, holds no credential at all, and appends an address to a spool it **cannot read**: the descriptor is `O_WRONLY \| O_APPEND`, so a read returns `EBADF`. |
+| `invite.kelliher.info/intake` | **Intake.** Public, unauthenticated, holds no credential at all, and appends an address to a spool it **cannot read, truncate or overwrite**: its group has write and nothing else through an ACL entry, and the file is `chattr +a`. |
 
 Read [`doc/THREAT-MODEL.md`](./doc/THREAT-MODEL.md) before changing any route,
 credential or group. It contains the only public unauthenticated endpoint on this
@@ -113,7 +113,7 @@ guest before any rollback past the enforcement change.
 |---|---|
 | mint | `127.0.0.1:9101`, reads and writes the intake table |
 | redeem | `127.0.0.1:9102`, one sqlite table of spent nonces |
-| intake | `127.0.0.1:9103`, one append to a write-only spool and nothing else |
+| intake | `127.0.0.1:9103`, one append to the spool and nothing else |
 
 The queue is two files in two places, deliberately. The **spool** lives at
 `/var/lib/gluck-portero-intake/spool.jsonl`, pre-created root-owned by tmpfiles
@@ -183,22 +183,24 @@ file, because that is the mistake that quietly undoes the split.
 
 ## Tests
 
-`nix flake check` runs eight suites, two whole-system tests and a packaging
-check: 12 checks.
+`nix flake check` runs eight suites, three whole-system tests, the reset and
+packaging checks: 13 checks. `sandbox` is a VM test and needs KVM.
 
 | suite | what it pins |
 |---|---|
 | `invites` | a token we did not sign is never interpreted; tampering, signature swaps, expiry, unsigned payloads; re-signing a nonce rebuilds exactly one token |
 | `spent` | single use comes from a primary key, not a read-then-write |
 | `budget` | a key spends only its own allowance; the window slides; memory is bounded when the key space is not |
-| `spool` | a read on the writer's descriptor is `EBADF`; an append landing between a read and the offset advance is not lost; a torn line is neither dropped nor half-parsed |
+| `spool` | the writer opens append-only; an append landing between a read and the offset advance is not lost; a torn line is neither dropped nor half-parsed; every outcome is reported |
 | `pending` | the cap is a schema trigger, not application politeness; approval has one winner; ingestion is exactly-once through `UNIQUE(email)` |
 | `redeem` | invalid, expired and used are byte-identical; the link works once; a typo does not burn it; a GET flood spends neither the POST budget nor the nonce; the token never reaches a log |
 | `mint` | `lldap_admin` cannot be granted; a caller without the group gets 403; a GraphQL error carrying HTTP 200 is not success; a rewritten intake row is never mailed |
 | `intake` | accepted, duplicate, malformed, flooded and full render identical bytes **and none is measurably faster**; no route returns a row; the address reaches no log |
 | `integration` | the original loop against a real lldap: zero credential, single use |
 | `pipeline` | intake to mail to redemption against a real lldap **and a real SMTP server**, with the intake unit started with no credentials directory |
-| `packaging` | all three entrypoints import out of the derivation the units execute, the public half's spool descriptor is unreadable in the **shipped** tree, and neither public half imports the mailer or sqlite |
+| `reset` | the shipped reset script's order: stop, lift append-only, truncate, restore it, remove the offset, start; on failure, restore it before the units return; its last line is the netmon contract |
+| `sandbox` | a NixOS VM importing this module. Restores spain's old layout and requires the probe to read the spool; migrates the way activation does; probes **inside the real intake and mint units**; runs the real reset with the real `chattr`; drives a signup to mint; reboots and probes again |
+| `packaging` | all three entrypoints import out of the derivation the units execute, the shipped intake opens its spool append-only, and neither public half imports the mailer or sqlite |
 
 `./negative-controls.sh` is the suite that tests the tests: it breaks nine
 properties one at a time and requires the named check to fail. One case is the
