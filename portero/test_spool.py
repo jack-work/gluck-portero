@@ -131,12 +131,38 @@ class Cap(unittest.TestCase):
             s.offer(f"user{i}@example.com")
         self.assertLessEqual(os.path.getsize(path), 200)
 
-    def test_declining_is_indistinguishable_from_accepting_at_the_api(self):
-        path, s = fresh(max_bytes=120)
+    def test_each_outcome_is_reported(self):
+        path, s = fresh()
         self.addCleanup(s.close)
-        self.assertIsNone(s.offer("one@example.com"))
-        self.assertIsNone(s.offer("two@example.com"))
-        self.assertIsNone(s.offer("three@example.com"))
+        self.assertEqual(s.offer("one@example.com"), (spool.WRITTEN, None))
+        s.max_bytes = os.path.getsize(path)
+        self.assertEqual(s.offer("two@example.com"), (spool.FULL, None))
+        s.max_bytes = 1 << 20
+        self.assertEqual(s.offer("x@example.com", "n" * (spool.RECORD_MAX + 1)),
+                         (spool.OVERSIZE, None))
+
+    def test_a_write_error_names_the_errno(self):
+        path, s = fresh()
+        self.addCleanup(s.close)
+        real = s._fd
+        s._fd = os.open(path, os.O_RDONLY)
+        try:
+            self.assertEqual(s.offer("one@example.com"), (spool.ERROR, "EBADF"))
+        finally:
+            os.close(s._fd)
+            s._fd = real
+
+    def test_a_short_write_is_an_error_not_a_success(self):
+        # A write that returns fewer bytes than the record leaves a torn line.
+        # The kernel rarely does this to a regular file, so it is forced here.
+        path, s = fresh()
+        self.addCleanup(s.close)
+        real_write = spool.os.write
+        spool.os.write = lambda fd, data: real_write(fd, data[:-1])
+        try:
+            self.assertEqual(s.offer("one@example.com"), (spool.ERROR, "SHORT_WRITE"))
+        finally:
+            spool.os.write = real_write
 
     def test_an_oversize_record_is_declined_not_truncated(self):
         path, s = fresh()

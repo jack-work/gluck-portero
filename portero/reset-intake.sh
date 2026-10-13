@@ -24,4 +24,4 @@ if [ -e "$PORTERO_OFFSET" ]; then
   echo "mint's spool offset survived removal" >&2
   exit 1
 fi
-echo "intake spool emptied and mint's offset removed"
+echo "<6>INFO intake spool reset spool_bytes=$size"

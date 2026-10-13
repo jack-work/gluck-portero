@@ -28,6 +28,11 @@ say "the spool is empty"
 [ ! -e "$PORTERO_OFFSET" ] || fail "offset survived"
 say "the offset is gone in the same run"
 
+# The line netmon parses to clear its last-known spool size after a reset.
+[ "$(tail -1 "$ROOT/out")" = "<6>INFO intake spool reset spool_bytes=0" ] \
+  || fail "reset line is not the agreed contract: $(tail -1 "$ROOT/out")"
+say "the reset line matches the netmon contract verbatim"
+
 expected="stop gluck-portero-intake.service
 stop gluck-portero-mint.service
 start gluck-portero-mint.service gluck-portero-intake.service"

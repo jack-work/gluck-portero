@@ -51,13 +51,16 @@ class Ingest(Base):
         self.assertEqual([r["email"] for r in rows], ["dad@example.com"])
         self.assertEqual(rows[0]["state"], "pending")
 
-    def test_the_public_half_learns_nothing_from_a_write(self):
-        # It cannot be used to test whether an address is already known. The
-        # spool's own tests prove the descriptor is unreadable; this proves the
-        # append returns no outcome either.
-        self.assertIsNone(self.w.offer("dad@example.com"))
-        self.assertIsNone(self.w.offer("dad@example.com"))
-        self.assertIsNone(self.w.offer("not an email"))
+    def test_the_public_half_learns_nothing_about_the_queue_from_a_write(self):
+        # The outcome exists for the journal, and it cannot reveal whether an
+        # address is already known: the spool does not deduplicate, so a repeat
+        # is written exactly like the first. Validation is intake's job, not
+        # the spool's.
+        first = self.w.offer("dad@example.com")
+        again = self.w.offer("dad@example.com")
+        self.assertEqual(first, (spool.WRITTEN, None))
+        self.assertEqual(again, first)
+        self.assertEqual(self.w.offer("not an email"), (spool.WRITTEN, None))
 
     def test_a_duplicate_address_lands_once_in_the_table(self):
         # At-least-once ingestion plus UNIQUE(email) is exactly-once.

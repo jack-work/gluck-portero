@@ -24,6 +24,7 @@ import time
 from flask import Flask, Response, request
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import spool
 from budget import Budget
 from spool import Spool
 
@@ -44,6 +45,18 @@ FLOOD = Budget(
 
 app = Flask(__name__)
 log = logging.getLogger("portero-intake")
+
+FLOODED = "flooded"
+MALFORMED = "malformed"
+
+LEVELS = {
+    spool.WRITTEN: logging.INFO,
+    spool.FULL: logging.WARNING,
+    spool.OVERSIZE: logging.WARNING,
+    spool.ERROR: logging.ERROR,
+    FLOODED: logging.WARNING,
+    MALFORMED: logging.INFO,
+}
 STORE = Spool(SPOOL_PATH, SPOOL_MAX)
 
 PAGE = """<!doctype html><meta charset=utf-8>
@@ -96,6 +109,43 @@ def settle(started):
         time.sleep(remaining)
 
 
+class JournalFormatter(logging.Formatter):
+    """Prefix every line with its sd-daemon priority, so journald records a
+    real PRIORITY instead of 6 for everything written to stderr."""
+
+    def __init__(self):
+        super().__init__("%(levelname)s %(message)s")
+
+    def format(self, record):
+        if record.levelno >= logging.CRITICAL:
+            prio = 2
+        elif record.levelno >= logging.ERROR:
+            prio = 3
+        elif record.levelno >= logging.WARNING:
+            prio = 4
+        elif record.levelno >= logging.INFO:
+            prio = 6
+        else:
+            prio = 7
+        return f"<{prio}>" + super().format(record)
+
+
+def spool_size():
+    try:
+        return STORE.size()
+    except OSError:
+        return -1
+
+
+def record_outcome(outcome, errno_name=None):
+    """The one line netmon parses. Its exact form is pinned in test_intake.py."""
+    line = (f"intake offer outcome={outcome} spool_bytes={spool_size()} "
+            f"spool_max={STORE.max_bytes}")
+    if outcome == spool.ERROR:
+        line += f" errno={errno_name or 'EUNKNOWN'}"
+    log.log(LEVELS[outcome], "%s", line)
+
+
 @app.get("/healthz")
 def healthz():
     return Response("ok\n", mimetype="text/plain")
@@ -113,17 +163,21 @@ def offer():
     accepted = FLOOD.spend()
     email = (request.form.get("email") or "").strip()
     note = (request.form.get("note") or "").strip()
-    if accepted and EMAIL_RE.fullmatch(email) and len(email) <= MAX_EMAIL:
-        STORE.offer(email.lower(), note[:MAX_NOTE])
-        log.info("intake offer written")
+    if not accepted:
+        outcome, errno_name = FLOODED, None
+    elif not (EMAIL_RE.fullmatch(email) and len(email) <= MAX_EMAIL):
+        outcome, errno_name = MALFORMED, None
     else:
-        log.info("intake offer dropped")
+        outcome, errno_name = STORE.offer(email.lower(), note[:MAX_NOTE])
+    record_outcome(outcome, errno_name)
     settle(started)
     return page("Thank you", TAKEN, status=202)
 
 
 def main():
-    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+    handler = logging.StreamHandler()
+    handler.setFormatter(JournalFormatter())
+    logging.basicConfig(level=logging.INFO, handlers=[handler])
     from waitress import serve
     port = int(os.environ.get("PORT", "9103"))
     serve(app, host="127.0.0.1", port=port, threads=4, ident=None)
