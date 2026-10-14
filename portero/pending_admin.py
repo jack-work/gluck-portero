@@ -96,6 +96,7 @@ def mac_fields(row):
 class IntakeAdmin:
     def __init__(self, path, cap, spool_path=None, offset_path=None):
         self._lock = threading.Lock()
+        self._ingest_lock = threading.Lock()
         self._db = connect(path, cap)
         self.cap = int(cap)
         self.spool_path = spool_path
@@ -120,6 +121,10 @@ class IntakeAdmin:
             return -1, errno_name(exc)
 
     def ingest(self):
+        with self._ingest_lock:
+            return self._ingest()
+
+    def _ingest(self):
         if not self.spool_path or not self.offset_path:
             return Ingested(OK, 0, 0, None)
         start, failure = self._offset_or_failure()

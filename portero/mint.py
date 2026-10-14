@@ -44,6 +44,7 @@ INTAKE_SPOOL = os.environ.get(
     "PORTERO_INTAKE_SPOOL", "/var/lib/gluck-portero-intake/spool.jsonl"
 )
 INTAKE_CAP = int(os.environ.get("PORTERO_INTAKE_CAP", "200"))
+INGEST_SECONDS = float(os.environ.get("PORTERO_INGEST_SECONDS", "60"))
 
 USERNAME_RE = re.compile(r"^[a-z][a-z0-9_-]{2,31}$")
 # lldap owns the uniqueness of an address, enforced by a database constraint.
@@ -328,6 +329,22 @@ def log_ingest(got, spool_bytes):
             got.outcome, got.landed, got.offset, spool_bytes)
 
 
+def ingest_tick():
+    try:
+        got = intake().ingest()
+    except Exception:
+        log.exception("mint ingest outcome=error offset=-1 spool_bytes=-1 errno=EXCEPTION")
+        return None
+    if got.outcome != pending_admin.OK or got.landed:
+        log_ingest(got, intake().spool_bytes()[0])
+    return got
+
+
+def ingest_every(seconds, stop):
+    while not stop.wait(seconds):
+        ingest_tick()
+
+
 @app.get("/intake")
 def list_intake():
     denied = forbidden()
@@ -468,6 +485,8 @@ def inherited_sockets():
 
 def main():
     journal.configure()
+    if INGEST_SECONDS > 0:
+        threading.Thread(target=ingest_every, args=(INGEST_SECONDS, threading.Event()), daemon=True).start()
     from waitress import serve
     sockets = inherited_sockets()
     if sockets:

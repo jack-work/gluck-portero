@@ -714,6 +714,55 @@ class IngestJournal(IntakeBase):
                          "<3>ERROR mint ingest outcome=error offset=0 spool_bytes=-1 errno=ENOENT")
         self.assertEqual(body["spool_bytes"], -1)
 
+    def test_a_tick_lands_a_signup_with_nobody_looking(self):
+        self.writer.offer("unwatched@example.com")
+        got = M.ingest_tick()
+        self.assertEqual((got.outcome, got.landed), ("ok", 1))
+        self.assertIn("unwatched@example.com", [r["email"] for r in self.admin.listing()])
+        self.assertEqual(self.ingest_lines(), [
+            f"<6>INFO mint ingest outcome=ok landed=1 offset={self.size()} spool_bytes={self.size()}"])
+
+    def test_a_quiet_tick_logs_nothing(self):
+        self.assertEqual(M.ingest_tick().outcome, "ok")
+        self.assertEqual(self.ingest_lines(), [])
+
+    def test_a_failing_tick_logs_the_error(self):
+        self.assertNotEqual(os.geteuid(), 0, "root reads a mode-000 file; run this unprivileged")
+        self.writer.offer("stalled@example.com")
+        os.chmod(_MINT_SPOOL, 0)
+        M.ingest_tick()
+        self.assertEqual(self.ingest_lines(),
+                         [f"<3>ERROR mint ingest outcome=error offset=0 spool_bytes={self.size()} errno=EACCES"])
+
+    def test_the_timer_ticks_until_stopped(self):
+        import threading
+        stop = threading.Event()
+        worker = threading.Thread(target=M.ingest_every, args=(0.01, stop))
+        worker.start()
+        self.writer.offer("ticked@example.com")
+        for _ in range(200):
+            if "ticked@example.com" in [r["email"] for r in self.admin.listing()]:
+                break
+            stop.wait(0.01)
+        stop.set()
+        worker.join(2)
+        self.assertFalse(worker.is_alive())
+        self.assertIn("ticked@example.com", [r["email"] for r in self.admin.listing()])
+
+    def test_ingests_are_serialised(self):
+        # Two ingests racing would both rewrite spool.offset.new; the lock is
+        # what prevents a torn offset, so prove ingest waits on it.
+        import threading
+        self.admin._ingest_lock.acquire()
+        worker = threading.Thread(target=self.admin.ingest)
+        worker.start()
+        worker.join(0.2)
+        blocked = worker.is_alive()
+        self.admin._ingest_lock.release()
+        worker.join(2)
+        self.assertTrue(blocked, "ingest ran without its lock")
+        self.assertFalse(worker.is_alive())
+
     def test_a_corrupt_offset_reports_minus_one(self):
         with open(M.INTAKE_OFFSET, "w", encoding="utf-8") as fh:
             fh.write("garbage")
