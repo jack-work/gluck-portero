@@ -24,6 +24,7 @@ import time
 from flask import Flask, Response, request
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import journal
 import spool
 from budget import Budget
 from spool import Spool
@@ -110,27 +111,6 @@ def settle(started):
         time.sleep(remaining)
 
 
-class JournalFormatter(logging.Formatter):
-    """Prefix every line with its sd-daemon priority, so journald records a
-    real PRIORITY instead of 6 for everything written to stderr."""
-
-    def __init__(self):
-        super().__init__("%(levelname)s %(message)s")
-
-    def format(self, record):
-        if record.levelno >= logging.CRITICAL:
-            prio = 2
-        elif record.levelno >= logging.ERROR:
-            prio = 3
-        elif record.levelno >= logging.WARNING:
-            prio = 4
-        elif record.levelno >= logging.INFO:
-            prio = 6
-        else:
-            prio = 7
-        return f"<{prio}>" + super().format(record)
-
-
 def spool_size():
     try:
         return STORE.size()
@@ -176,9 +156,7 @@ def offer():
 
 
 def main():
-    handler = logging.StreamHandler()
-    handler.setFormatter(JournalFormatter())
-    logging.basicConfig(level=logging.INFO, handlers=[handler])
+    journal.configure()
     from waitress import serve
     port = int(os.environ.get("PORT", "9103"))
     serve(app, host="127.0.0.1", port=port, threads=4, ident=None)

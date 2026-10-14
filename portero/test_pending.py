@@ -37,7 +37,7 @@ class Base(unittest.TestCase):
     def offer(self, email, note=""):
         """A submission, the way one really arrives: appended then ingested."""
         self.w.offer(email, note)
-        return self.a.ingest()
+        return self.a.ingest().landed
 
     def tearDown(self):
         self.w.close()
@@ -72,7 +72,7 @@ class Ingest(Base):
         self.offer("dad@example.com")
         with open(self.a.offset_path, "w", encoding="utf-8") as fh:
             fh.write("0")
-        self.assertEqual(self.a.ingest(), 0, "the INSERT must be swallowed")
+        self.assertEqual(self.a.ingest().landed, 0, "the INSERT must be swallowed")
         self.assertEqual(len(self.a.listing()), 1)
 
     def test_duplicate_is_swallowed_and_stores_one_row(self):
@@ -229,7 +229,7 @@ class FullTableDefers(Base):
     def test_the_refused_record_stays_in_the_spool(self):
         self.fill()
         self.w.offer("waiting@example.com")
-        self.assertEqual(self.a.ingest(), 0)
+        self.assertEqual(self.a.ingest().landed, 0)
         self.assertLess(self.a.offset(), os.path.getsize(self.spool_path))
         self.assertNotIn("waiting@example.com",
                          [r["email"] for r in self.a.listing(state=None)])
@@ -239,7 +239,7 @@ class FullTableDefers(Base):
         self.w.offer("waiting@example.com")
         self.a.ingest()
         self.a.reject(self.a.listing()[0]["id"], "admin")
-        self.assertEqual(self.a.ingest(), 1)
+        self.assertEqual(self.a.ingest().landed, 1)
         self.assertIn("waiting@example.com",
                       [r["email"] for r in self.a.listing(state=None)])
         self.assertEqual(self.a.offset(), os.path.getsize(self.spool_path))
@@ -260,8 +260,78 @@ class FullTableDefers(Base):
         self.offer("dad@example.com")
         self.w.offer("dad@example.com")
         self.w.offer("next@example.com")
-        self.assertEqual(self.a.ingest(), 1)
+        self.assertEqual(self.a.ingest().landed, 1)
         self.assertEqual(self.a.offset(), os.path.getsize(self.spool_path))
+
+
+class IngestOutcome(Base):
+    """An ingest that cannot happen is an outcome mint must report. Each of
+    these used to come back as a quiet 0, which reads exactly like an empty
+    spool, so the rollback stall showed the operator nothing waiting."""
+
+    def unprivileged(self):
+        self.assertNotEqual(os.geteuid(), 0, "root reads a mode-000 file; run this unprivileged")
+
+    def test_ok_reports_what_landed_and_where_it_stopped(self):
+        self.w.offer("dad@example.com")
+        got = self.a.ingest()
+        self.assertEqual((got.outcome, got.landed, got.offset, got.errno),
+                         ("ok", 1, os.path.getsize(self.spool_path), None))
+
+    def test_an_unreadable_spool_is_an_error_with_its_errno(self):
+        self.unprivileged()
+        self.w.offer("dad@example.com")
+        os.chmod(self.spool_path, 0)
+        got = self.a.ingest()
+        self.assertEqual((got.outcome, got.landed, got.offset, got.errno),
+                         ("error", 0, 0, "EACCES"))
+
+    def test_a_missing_spool_is_an_error_and_its_size_is_minus_one(self):
+        os.unlink(self.spool_path)
+        got = self.a.ingest()
+        self.assertEqual((got.outcome, got.errno), ("error", "ENOENT"))
+        self.assertEqual(self.a.spool_bytes(), (-1, 0))
+
+    def test_an_unreadable_spool_still_reports_its_size(self):
+        self.unprivileged()
+        self.w.offer("dad@example.com")
+        os.chmod(self.spool_path, 0)
+        self.assertEqual(self.a.spool_bytes(), (os.path.getsize(self.spool_path), 0))
+
+    def test_a_missing_offset_is_the_start(self):
+        self.assertFalse(os.path.exists(self.a.offset_path))
+        self.assertEqual(self.a.offset(), 0)
+        self.w.offer("dad@example.com")
+        self.assertEqual(self.a.ingest().outcome, "ok")
+
+    def test_a_corrupt_offset_is_an_error_and_nothing_is_reread(self):
+        self.w.offer("dad@example.com")
+        self.a.ingest()
+        self.a.reject(self.a.listing()[0]["id"], "admin")
+        for corrupt in ("garbage", "", "-5"):
+            with open(self.a.offset_path, "w", encoding="utf-8") as fh:
+                fh.write(corrupt)
+            got = self.a.ingest()
+            self.assertEqual((got.outcome, got.landed, got.offset, got.errno),
+                             ("error", 0, -1, "BAD_OFFSET"), corrupt)
+            self.assertEqual(self.a.spool_bytes()[1], -1, corrupt)
+
+    def test_an_unreadable_offset_is_an_error(self):
+        self.unprivileged()
+        self.w.offer("dad@example.com")
+        self.a.ingest()
+        os.chmod(self.a.offset_path, 0)
+        got = self.a.ingest()
+        self.assertEqual((got.outcome, got.offset, got.errno), ("error", -1, "EACCES"))
+
+    def test_a_full_table_is_held_not_ok(self):
+        for i in range(self.cap):
+            self.offer(f"user{i}@example.com")
+        self.w.offer("waiting@example.com")
+        got = self.a.ingest()
+        self.assertEqual((got.outcome, got.landed), ("held", 0))
+        self.assertEqual(got.offset, self.a.offset())
+        self.assertLess(got.offset, os.path.getsize(self.spool_path))
 
 
 if __name__ == "__main__":

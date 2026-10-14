@@ -14,10 +14,12 @@ and the table's UNIQUE(email) makes it exactly-once: a crash before the offset
 is stored re-reads, and the duplicate INSERT is swallowed.
 """
 
+import errno
 import os
 import sqlite3
 import threading
 import time
+from collections import namedtuple
 
 import spool
 
@@ -69,6 +71,20 @@ def connect(path, cap):
 
 
 
+OK, HELD, FAILED = "ok", "held", "error"
+BAD_OFFSET = "BAD_OFFSET"
+
+Ingested = namedtuple("Ingested", "outcome landed offset errno")
+
+
+class OffsetCorrupt(ValueError):
+    pass
+
+
+def errno_name(exc):
+    return errno.errorcode.get(exc.errno, "EUNKNOWN")
+
+
 MAC_FIELDS = ("id", "email", "username", "nonce", "expires_at")
 NOTE_MAX = 280
 
@@ -88,31 +104,32 @@ class IntakeAdmin:
     def offset(self):
         try:
             with open(self.offset_path, "r", encoding="utf-8") as fh:
-                return int(fh.read().strip() or 0)
-        except (OSError, ValueError):
+                text = fh.read().strip()
+        except FileNotFoundError:
             return 0
+        if not (text.isascii() and text.isdigit()):
+            raise OffsetCorrupt(text)
+        return int(text)
+
+    def _offset_or_failure(self):
+        try:
+            return self.offset(), None
+        except OffsetCorrupt:
+            return -1, BAD_OFFSET
+        except OSError as exc:
+            return -1, errno_name(exc)
 
     def ingest(self):
-        """Pull new spool records into the table. Returns how many landed.
-
-        The offset advances only after the rows are committed, so a crash
-        re-reads them and UNIQUE(email) refuses the duplicates. Nothing is ever
-        written to the spool from here: no truncate, no rename, no unlink, so an
-        append landing mid-ingest is simply next.
-
-        A full table stops ingestion at the refused record and leaves the offset
-        on it, so the submission waits in the spool until the operator frees a
-        slot. Swallowing that refusal like a duplicate would consume the record
-        and lose a real signup that nobody could see go.
-        """
         if not self.spool_path or not self.offset_path:
-            return 0
-        start = self.offset()
+            return Ingested(OK, 0, 0, None)
+        start, failure = self._offset_or_failure()
+        if failure:
+            return Ingested(FAILED, 0, start, failure)
         try:
             entries, end = spool.entries_from(self.spool_path, start)
-        except OSError:
-            return 0
-        landed = 0
+        except OSError as exc:
+            return Ingested(FAILED, 0, start, errno_name(exc))
+        landed, outcome = 0, OK
         with self._lock:
             for row, begin, _ in entries:
                 try:
@@ -125,21 +142,24 @@ class IntakeAdmin:
                     landed += 1
                 except sqlite3.IntegrityError as exc:
                     if TABLE_FULL in str(exc):
-                        end = begin
+                        end, outcome = begin, HELD
                         break
         if end != start:
             tmp = self.offset_path + ".new"
-            with open(tmp, "w", encoding="utf-8") as fh:
-                fh.write(str(end))
-            os.replace(tmp, self.offset_path)
-        return landed
+            try:
+                with open(tmp, "w", encoding="utf-8") as fh:
+                    fh.write(str(end))
+                os.replace(tmp, self.offset_path)
+            except OSError as exc:
+                return Ingested(FAILED, landed, start, errno_name(exc))
+        return Ingested(outcome, landed, end, None)
 
     def spool_bytes(self):
-        """What the operator needs to see a full spool coming."""
         try:
-            return os.path.getsize(self.spool_path), self.offset()
+            size = os.path.getsize(self.spool_path)
         except (OSError, TypeError):
-            return 0, 0
+            size = -1
+        return size, self._offset_or_failure()[0]
 
     def _rows(self, sql, args=()):
         with self._lock:

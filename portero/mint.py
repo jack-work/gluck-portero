@@ -24,7 +24,9 @@ from flask import Flask, jsonify, request
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import invites
+import journal
 import mailer
+import pending_admin
 from pending_admin import IntakeAdmin, mac_fields
 
 LLDAP_URL = os.environ.get("PORTERO_LLDAP_URL", "http://127.0.0.1:17170")
@@ -316,6 +318,16 @@ def deliver(row_id, email, url, expires_at, username):
     return None
 
 
+def log_ingest(got, spool_bytes):
+    if got.outcome == pending_admin.FAILED:
+        log.error("mint ingest outcome=error offset=%d spool_bytes=%d errno=%s",
+                  got.offset, spool_bytes, got.errno)
+        return
+    level = logging.WARNING if got.outcome == pending_admin.HELD else logging.INFO
+    log.log(level, "mint ingest outcome=%s landed=%d offset=%d spool_bytes=%d",
+            got.outcome, got.landed, got.offset, spool_bytes)
+
+
 @app.get("/intake")
 def list_intake():
     denied = forbidden()
@@ -324,14 +336,17 @@ def list_intake():
     state = request.args.get("state", "pending")
     if state == "all":
         state = None
-    landed = intake().ingest()
+    got = intake().ingest()
     rows = intake().listing(state=state)
     total, consumed = intake().spool_bytes()
+    log_ingest(got, total)
     return jsonify(
         rows=[view(r) for r in rows],
         counts=intake().counts(),
         pending_capacity=INTAKE_CAP,
-        ingested_now=landed,
+        ingest=got.outcome,
+        ingest_errno=got.errno,
+        ingested_now=None if got.outcome == pending_admin.FAILED else got.landed,
         spool_bytes=total,
         spool_consumed=consumed,
         spool_max=int(os.environ.get("PORTERO_INTAKE_SPOOL_MAX", str(1 << 20))),
@@ -452,7 +467,7 @@ def inherited_sockets():
 
 
 def main():
-    logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
+    journal.configure()
     from waitress import serve
     sockets = inherited_sockets()
     if sockets:
