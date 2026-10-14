@@ -26,7 +26,7 @@ pkgs.testers.runNixOSTest {
       adminPasswordFile = pkgs.writeText "admin_password" "fixture-admin";
       redeemPasswordFile = pkgs.writeText "redeem_password" "fixture-redeem";
     };
-    environment.systemPackages = [ pkgs.acl pkgs.e2fsprogs pkgs.curl ];
+    environment.systemPackages = [ pkgs.acl pkgs.e2fsprogs pkgs.curl pkgs.dosfstools ];
 
     # A mirror of what kelliher-web 6a8d9c4 gives a proxySocket site, so mint
     # can start. The socket mechanism itself is checks.socket's subject.
@@ -230,10 +230,10 @@ pkgs.testers.runNixOSTest {
 
     with subtest("a filesystem that cannot hold the layout: success only with the layout read back"):
         m.succeed("systemctl stop gluck-portero-intake gluck-portero-mint")
-        m.succeed("truncate -s 16M /tmp/noacl.img && mkfs.ext4 -F -q /tmp/noacl.img")
+        m.succeed("truncate -s 16M /tmp/vfat.img && mkfs.vfat /tmp/vfat.img")
         for fs, mount in (
             ("tmpfs", "mount -t tmpfs -o mode=0711 tmpfs /var/lib/gluck-portero-intake"),
-            ("ext4-noacl", "mount -o loop,noacl /tmp/noacl.img /var/lib/gluck-portero-intake && chmod 0711 /var/lib/gluck-portero-intake"),
+            ("vfat", "mount -o loop,uid=0,gid=0,umask=0066 /tmp/vfat.img /var/lib/gluck-portero-intake"),
         ):
             m.succeed(mount)
             code = run_layout()
@@ -246,8 +246,8 @@ pkgs.testers.runNixOSTest {
             else:
                 assert show_result() == "exit-code", (fs, show_result())
                 assert line.startswith("ERROR intake spool layout"), (fs, line)
-            if fs == "ext4-noacl":
-                assert code != 0, "a filesystem without ACLs must fail the unit"
+            if fs == "vfat":
+                assert code != 0, "a filesystem without ACLs or attributes must fail the unit"
             m.succeed(f"chattr -a {spool} 2>/dev/null; umount /var/lib/gluck-portero-intake")
         assert run_layout() == 0
         m.succeed("systemctl start gluck-portero-mint gluck-portero-intake")
