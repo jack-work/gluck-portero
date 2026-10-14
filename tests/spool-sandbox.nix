@@ -19,6 +19,7 @@ pkgs.testers.runNixOSTest {
         };
       }
     ];
+    system.switch.enable = true;
     services.gluck-portero = {
       enable = true;
       inviteKeyFile = pkgs.writeText "invite_key" "kkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkkk";
@@ -47,6 +48,7 @@ pkgs.testers.runNixOSTest {
   };
 
   testScript = ''
+    import json
     import re
 
     spool = "/var/lib/gluck-portero-intake/spool.jsonl"
@@ -54,6 +56,37 @@ pkgs.testers.runNixOSTest {
     every = "read append open_without_append ftruncate pwrite_at_zero"
     admin = "-H 'Remote-User: admin' -H 'Remote-Groups: portero-admin'"
     mint = "--unix-socket /run/kweb/gluck-portero-mint.sock http://mint"
+    L = "gluck-portero-spool-layout.service"
+    noop = f"/run/systemd/system/{L}.d/absent.conf"
+    switch = "/run/current-system/bin/switch-to-configuration test 2>&1"
+
+    def layout_unit_absent():
+        m.succeed(f"mkdir -p $(dirname {noop}) && printf '[Service]\\nExecStart=\\nExecStart=/run/current-system/sw/bin/true\\n' > {noop}")
+        m.succeed("systemctl daemon-reload")
+
+    def layout_unit_present():
+        m.succeed(f"rm -f {noop} && systemctl daemon-reload")
+
+    def layout_line():
+        m.succeed("journalctl --sync")
+        return m.succeed(f"journalctl -u {L} -o cat | grep 'intake spool layout' | tail -1").strip()
+
+    def show_result():
+        return m.succeed(f"systemctl show -P Result {L}").strip()
+
+    def run_layout():
+        m.succeed(f"systemctl reset-failed {L}")
+        return m.execute(f"systemctl start {L}")[0]
+
+    def activate():
+        m.succeed(f"systemctl reset-failed {L}")
+        code, out = m.execute(switch)
+        print(out)
+        return code, out
+
+    def mint_ingest_lines(priority):
+        m.succeed("journalctl --sync")
+        return m.succeed(f"journalctl -u gluck-portero-mint -p {priority} -o cat | grep 'mint ingest' || true")
 
     def run_probe(unit, restart=True, steps=None):
         steps = steps or every
@@ -64,13 +97,13 @@ pkgs.testers.runNixOSTest {
             f"ExecStart={probe} {spool} {steps}\\n' > {d}/probe.conf"
         )
         m.succeed("systemctl daemon-reload")
-        m.succeed(f"systemctl reset-failed {unit}.service")
+        m.succeed(f"systemctl reset-failed {unit}.service {L}")
         m.succeed(f"systemctl restart {unit}.service")
         inv = m.succeed(f"systemctl show -P InvocationID {unit}.service").strip()
         m.succeed("journalctl --sync")
         out = m.succeed(f"journalctl -o cat _SYSTEMD_INVOCATION_ID={inv}")
         m.succeed(f"rm {d}/probe.conf && systemctl daemon-reload")
-        m.succeed(f"systemctl reset-failed {unit}.service")
+        m.succeed(f"systemctl reset-failed {unit}.service {L}")
         if restart:
             m.succeed(f"systemctl restart {unit}.service")
             m.wait_for_unit(f"{unit}.service")
@@ -85,6 +118,9 @@ pkgs.testers.runNixOSTest {
             f"getfacl -cp {spool}; lsattr {spool}"
         )
 
+    def ctime():
+        return m.succeed(f"stat -c %z {spool}").strip()
+
     m.wait_for_unit("multi-user.target")
     m.wait_for_unit("gluck-portero-intake.service")
     m.wait_for_unit("gluck-portero-mint.service")
@@ -92,6 +128,7 @@ pkgs.testers.runNixOSTest {
     print(m.succeed("stat -f -c 'var/lib fs: %T' /var/lib"))
 
     with subtest("positive control: the probe sees F1 under the layout spain runs today"):
+        layout_unit_absent()
         m.succeed("systemctl stop gluck-portero-intake gluck-portero-mint")
         m.succeed(f"chattr -a {spool}; setfacl -b {spool}")
         m.succeed(f"chown root:portero-intake {spool}; chmod 0660 {spool}")
@@ -103,8 +140,13 @@ pkgs.testers.runNixOSTest {
         assert old["read"] == "OK", old
         assert old["ftruncate"] == "OK", old
 
-    with subtest("migration: activation's tmpfiles run applies the new layout"):
+    with subtest("migration: one activation applies the new layout"):
+        layout_unit_present()
         m.succeed("systemctl restart systemd-tmpfiles-resetup.service")
+        code, out = activate()
+        assert code == 0, (code, out)
+        line = layout_line()
+        assert line.startswith("WARNING intake spool layout repaired: owner=root:portero-intake ") and line.endswith(" append_only=no"), line
         print(layout())
         m.succeed(f"stat -c '%U:%G' {spool} | grep -qx root:portero-spool-reader")
         m.succeed("stat -c '%a %U:%G' /var/lib/gluck-portero-intake | grep -qx '711 root:root'")
@@ -156,38 +198,83 @@ pkgs.testers.runNixOSTest {
         signup_reaches_mint("first@example.com")
         m.succeed("journalctl -o cat -u gluck-portero-intake | grep -q 'outcome=written'")
 
-    with subtest("a second tmpfiles run changes nothing and breaks nothing"):
-        before = layout()
-        m.succeed("systemctl restart systemd-tmpfiles-resetup.service")
-        assert layout() == before, (before, layout())
+    with subtest("an unchanged layout is left alone: same ctime, +a never lifted"):
+        before, c0 = layout(), ctime()
+        m.succeed("sleep 1.1")
+        code, out = activate()
+        assert code == 0, (code, out)
+        assert layout_line() == "INFO intake spool layout ok", layout_line()
+        assert (layout(), ctime()) == (before, c0), (before, c0, layout(), ctime())
         m.fail("systemctl is-failed --quiet systemd-tmpfiles-resetup.service")
         signup_reaches_mint("second@example.com")
 
-    with subtest("drift under this release's rules, MEASURED"):
-        # +a refuses chown to root. Whether it also refuses the chmod and the
-        # ACL write that tmpfiles performs when values DIFFER is measured here
-        # rather than assumed, along with whether the remedy restores the layout.
+    with subtest("drift is repaired, named, and changes ctime"):
         good = layout()
-        for name, drift in (
-            ("mode", f"chmod 0640 {spool}"),
-            ("acl", f"setfacl -x group:portero-intake {spool}"),
+        for name, drift, field in (
+            ("mode", f"chattr -a {spool} && chmod 0640 {spool} && chattr +a {spool}", "mode=640"),
+            ("acl", f"chattr -a {spool} && setfacl -x group:portero-intake {spool} && chattr +a {spool}", "acl="),
+            ("append_only", f"chattr -a {spool}", "append_only=no"),
+            ("owner", f"chattr -a {spool} && chown root:root {spool} && chattr +a {spool}", "owner=root:root"),
         ):
-            m.succeed(f"chattr -a {spool} && {drift} && chattr +a {spool}")
-            code, out = m.execute("systemctl restart systemd-tmpfiles-resetup.service 2>&1")
-            failed = m.execute("systemctl is-failed --quiet systemd-tmpfiles-resetup.service")[0] == 0
-            journal = m.succeed("journalctl -o cat -u systemd-tmpfiles-resetup.service -n 5 --no-pager")
-            print(f"DRIFT {name}: restart exit {code}, unit failed {failed}, journal: {journal!r}")
-            print(f"DRIFT {name} layout after: {layout()!r}")
-            assert not failed, ("tmpfiles reports success even when it cannot repair", name)
-            assert "Operation not permitted" in journal, (name, journal)
-            assert layout() != good, ("expected the drift to persist", name)
-            m.succeed(f"chattr -a {spool}")
-            m.succeed("systemctl reset-failed systemd-tmpfiles-resetup.service")
-            m.succeed("systemctl restart systemd-tmpfiles-resetup.service")
-            assert layout() == good, (name, "remedy did not restore", layout(), good)
-            print(f"DRIFT {name}: remedy (chattr -a, re-run) restores the layout")
+            m.succeed(drift)
+            assert layout() != good, ("drift did not take", name)
+            c0 = ctime()
+            m.succeed("sleep 1.1")
+            assert run_layout() == 0, name
+            line = layout_line()
+            print(f"DRIFT {name}: {line}")
+            assert line.startswith("WARNING intake spool layout repaired: ") and field in line, (name, line)
+            assert layout() == good, (name, layout(), good)
+            assert ctime() != c0, ("a repair must show in ctime, or the ctime control proves nothing", name)
+        signup_reaches_mint("drift@example.com")
+
+    with subtest("a filesystem that cannot hold the layout: success only with the layout read back"):
+        m.succeed("systemctl stop gluck-portero-intake gluck-portero-mint")
+        m.succeed("truncate -s 16M /tmp/noacl.img && mkfs.ext4 -F -q /tmp/noacl.img")
+        for fs, mount in (
+            ("tmpfs", "mount -t tmpfs -o mode=0711 tmpfs /var/lib/gluck-portero-intake"),
+            ("ext4-noacl", "mount -o loop,noacl /tmp/noacl.img /var/lib/gluck-portero-intake && chmod 0711 /var/lib/gluck-portero-intake"),
+        ):
+            m.succeed(mount)
+            code = run_layout()
+            line = layout_line()
+            print(f"FS {fs}: exit {code}: {line}")
+            if code == 0:
+                assert line.startswith("WARNING intake spool layout repaired"), (fs, line)
+                m.succeed(f"getfacl -cp {spool} | grep -qx 'group:portero-intake:-w-'")
+                m.succeed(f"lsattr {spool} | cut -c1-22 | grep -q a")
+            else:
+                assert show_result() == "exit-code", (fs, show_result())
+                assert line.startswith("ERROR intake spool layout"), (fs, line)
+            if fs == "ext4-noacl":
+                assert code != 0, "a filesystem without ACLs must fail the unit"
+            m.succeed(f"chattr -a {spool} 2>/dev/null; umount /var/lib/gluck-portero-intake")
+        assert run_layout() == 0
+        m.succeed("systemctl start gluck-portero-mint gluck-portero-intake")
+        signup_reaches_mint("fs@example.com")
+
+    with subtest("a step forced to fail fails the unit, restores +a, keeps intake down, and fails activation"):
+        m.succeed(f"chattr -a {spool} && chmod 0600 {spool} && chattr +i {spool}")
+        assert run_layout() != 0
+        assert show_result() == "exit-code", show_result()
+        assert layout_line() == 'ERROR intake spool layout failed at: chown -- "$WANT_OWNER" "$PORTERO_SPOOL"', layout_line()
+        m.succeed(f"lsattr {spool} | cut -c1-22 | grep -q a")
+        pid = m.succeed("systemctl show -P MainPID gluck-portero-intake").strip()
+        m.succeed(f"systemctl reset-failed {L}")
+        code, _ = m.execute("systemctl restart gluck-portero-intake")
+        assert code != 0, "intake restarted over a failed layout"
+        m.fail("systemctl is-active --quiet gluck-portero-intake")
+        print("intake after a refused restart:", m.succeed("systemctl show -P ActiveState,Result gluck-portero-intake"), "was pid", pid)
+        code, out = activate()
+        assert code != 0 and re.search(rf"the following units failed: .*{re.escape(L)}", out), (code, out)
+        m.succeed(f"chattr -i {spool}")
+        assert run_layout() == 0
+        assert layout_line().startswith("WARNING intake spool layout repaired"), layout_line()
+        m.succeed("systemctl reset-failed gluck-portero-intake && systemctl start gluck-portero-intake")
+        signup_reaches_mint("forced@example.com")
 
     with subtest("rollback: the previous release's rules cannot re-own the spool"):
+        layout_unit_absent()
         # Emulates what a rollback to gluck-portero 27acc90 does to this file:
         # its two tmpfiles lines, verbatim, applied as systemd-tmpfiles-resetup
         # applies them, and mint back in portero-intake, its old group. Units
@@ -222,8 +309,14 @@ pkgs.testers.runNixOSTest {
             "curl -s -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:9103/intake -d email=stalled@example.com"
         )
         assert http == "202", http
-        stalled = m.succeed(f"curl -fs {admin} {mint}/intake")
-        assert "stalled@example.com" not in stalled, ("expected a stall", stalled)
+        stalled = json.loads(m.succeed(f"curl -fs {admin} {mint}/intake"))
+        assert "stalled@example.com" not in [r["email"] for r in stalled["rows"]], ("expected a stall", stalled)
+        assert (stalled["ingest"], stalled["ingest_errno"], stalled["ingested_now"]) == ("error", "EACCES", None), stalled
+        assert stalled["spool_bytes"] > stalled["spool_consumed"], stalled
+        err = mint_ingest_lines("err")
+        assert re.search(r"^ERROR mint ingest outcome=error offset=\d+ spool_bytes=\d+ errno=EACCES$", err, re.M), err
+        assert "outcome=ok" not in err, ("an ok line at priority err: the -p filter is not filtering", err)
+        assert "outcome=ok" in mint_ingest_lines("info"), "control: ok lines exist below err"
         m.succeed(f"grep -q stalled@example.com {spool}")
         m.fail(f"truncate -s 0 {spool}")
 
@@ -247,9 +340,13 @@ pkgs.testers.runNixOSTest {
         assert run_probe("gluck-portero-intake", steps="append")["append"] == "OK"
         m.succeed(f"truncate -s 0 {spool}")
 
-    with subtest("roll forward: this release's rules restore the new layout"):
-        m.succeed(f"rm {d}/rollback.conf && systemctl daemon-reload")
+    with subtest("roll forward: one activation restores the new layout"):
+        m.succeed(f"rm {d}/rollback.conf")
+        layout_unit_present()
         m.succeed("systemctl restart systemd-tmpfiles-resetup.service")
+        code, out = activate()
+        assert code == 0, (code, out)
+        assert layout_line().startswith("WARNING intake spool layout repaired"), layout_line()
         m.succeed("systemctl reset-failed gluck-portero-mint.service && systemctl restart gluck-portero-mint.service")
         print(layout())
         m.succeed(f"stat -c '%U:%G' {spool} | grep -qx root:portero-spool-reader")
@@ -266,6 +363,8 @@ pkgs.testers.runNixOSTest {
         m.wait_for_unit("gluck-portero-mint.service")
         print(layout())
         m.fail("systemctl is-failed --quiet systemd-tmpfiles-setup.service")
+        m.succeed(f"journalctl -b -u {L} -o cat | grep -q 'intake spool layout'")
+        assert show_result() == "success", show_result()
         signup_reaches_mint("third@example.com")
         got = run_probe("gluck-portero-intake")
         assert got["read"] == "EACCES", got
