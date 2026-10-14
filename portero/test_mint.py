@@ -722,9 +722,10 @@ class IngestJournal(IntakeBase):
         self.assertEqual(self.ingest_lines(), [
             f"<6>INFO mint ingest outcome=ok landed=1 offset={self.size()} spool_bytes={self.size()}"])
 
-    def test_a_quiet_tick_logs_nothing(self):
+    def test_a_quiet_tick_still_logs_so_silence_means_a_dead_clock(self):
         self.assertEqual(M.ingest_tick().outcome, "ok")
-        self.assertEqual(self.ingest_lines(), [])
+        self.assertEqual(self.ingest_lines(), [
+            f"<6>INFO mint ingest outcome=ok landed=0 offset={self.size()} spool_bytes={self.size()}"])
 
     def test_a_failing_tick_logs_the_error(self):
         self.assertNotEqual(os.geteuid(), 0, "root reads a mode-000 file; run this unprivileged")

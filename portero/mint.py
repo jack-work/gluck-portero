@@ -335,8 +335,7 @@ def ingest_tick():
     except Exception:
         log.exception("mint ingest outcome=error offset=-1 spool_bytes=-1 errno=EXCEPTION")
         return None
-    if got.outcome != pending_admin.OK or got.landed:
-        log_ingest(got, intake().spool_bytes()[0])
+    log_ingest(got, intake().spool_bytes()[0])
     return got
 
 
