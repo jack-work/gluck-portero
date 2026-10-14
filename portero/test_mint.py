@@ -645,5 +645,83 @@ class DuplicateEmail(IntakeBase):
                          "a crash must still release the row")
 
 
+class IngestJournal(IntakeBase):
+    """One line per ingest attempt, in a form netmon parses. Pinned verbatim:
+    a failure must never read as an empty spool, in the log or the listing."""
+
+    def setUp(self):
+        super().setUp()
+        import io
+        import logging
+        import journal
+        self.stream = io.StringIO()
+        self.handler = logging.StreamHandler(self.stream)
+        self.handler.setFormatter(journal.JournalFormatter())
+        M.log.addHandler(self.handler)
+        M.log.setLevel(logging.INFO)
+
+    def tearDown(self):
+        M.log.removeHandler(self.handler)
+        os.chmod(_MINT_SPOOL, 0o644)
+        super().tearDown()
+
+    def ingest_lines(self):
+        return [l for l in self.stream.getvalue().splitlines() if " mint ingest " in l]
+
+    def size(self):
+        return os.path.getsize(_MINT_SPOOL)
+
+    def test_ok(self):
+        self.writer.offer("dad@example.com")
+        body = self.listing().get_json()
+        self.assertEqual(self.ingest_lines(), [
+            f"<6>INFO mint ingest outcome=ok landed=1 offset={self.size()} spool_bytes={self.size()}"])
+        self.assertEqual((body["ingest"], body["ingest_errno"], body["ingested_now"]), ("ok", None, 1))
+
+    def test_held(self):
+        for i in range(M.INTAKE_CAP):
+            self.row(f"user{i}@example.com")
+        held_at = self.size()
+        self.writer.offer("waiting@example.com")
+        body = self.listing().get_json()
+        self.assertEqual(self.ingest_lines()[-1],
+                         f"<4>WARNING mint ingest outcome=held landed=0 offset={held_at} spool_bytes={self.size()}")
+        self.assertEqual(body["ingest"], "held")
+
+    def test_an_unreadable_spool_is_an_error_not_an_empty_queue(self):
+        self.assertNotEqual(os.geteuid(), 0, "root reads a mode-000 file; run this unprivileged")
+        self.row("before@example.com")
+        consumed = self.size()
+        self.writer.offer("stalled@example.com")
+        os.chmod(_MINT_SPOOL, 0)
+        resp = self.listing()
+        body = resp.get_json()
+        self.assertEqual(self.ingest_lines()[-1],
+                         f"<3>ERROR mint ingest outcome=error offset={consumed} spool_bytes={self.size()} errno=EACCES")
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual((body["ingest"], body["ingest_errno"], body["ingested_now"]),
+                         ("error", "EACCES", None))
+        self.assertEqual([r["email"] for r in body["rows"]], ["before@example.com"])
+        self.assertGreater(body["spool_bytes"], body["spool_consumed"])
+
+    def test_a_missing_spool_reports_minus_one_bytes(self):
+        os.unlink(_MINT_SPOOL)
+        try:
+            body = self.listing().get_json()
+        finally:
+            open(_MINT_SPOOL, "wb").close()
+        self.assertEqual(self.ingest_lines()[-1],
+                         "<3>ERROR mint ingest outcome=error offset=0 spool_bytes=-1 errno=ENOENT")
+        self.assertEqual(body["spool_bytes"], -1)
+
+    def test_a_corrupt_offset_reports_minus_one(self):
+        with open(M.INTAKE_OFFSET, "w", encoding="utf-8") as fh:
+            fh.write("garbage")
+        body = self.listing().get_json()
+        self.assertEqual(self.ingest_lines()[-1],
+                         f"<3>ERROR mint ingest outcome=error offset=-1 spool_bytes={self.size()} errno=BAD_OFFSET")
+        self.assertEqual(body["spool_consumed"], -1)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
