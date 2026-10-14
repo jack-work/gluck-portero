@@ -380,19 +380,38 @@
               # reassigned after a reboot therefore inherits nothing.
               systemd.tmpfiles.rules = [
                 "d ${cfg.intakeDirectory} 0711 root root -"
-                "f ${spoolFile} 0660 root ${readerGroup} -"
-                "a+ ${spoolFile} - - - - group::r--,group:${intakeGroup}:-w-"
-                "h ${spoolFile} - - - - +a"
               ];
 
-              systemd.services.gluck-portero-intake = {
-                description = "gluck-portero-intake: the public signup spool's only writer";
+              systemd.services.gluck-portero-spool-layout = {
+                description = "gluck-portero: hold the intake spool's owner, mode, ACL and append-only flag";
                 after = [
-                  "network.target"
+                  "local-fs.target"
                   "systemd-tmpfiles-setup.service"
                   "systemd-tmpfiles-resetup.service"
                 ];
-                requires = [ "systemd-tmpfiles-setup.service" ];
+                before = [ "sysinit-reactivation.target" ];
+                requiredBy = [ "sysinit-reactivation.target" ];
+                environment = {
+                  PORTERO_SPOOL = spoolFile;
+                  PORTERO_READER_GROUP = readerGroup;
+                  PORTERO_WRITER_GROUP = intakeGroup;
+                };
+                path = [ pkgs.coreutils pkgs.e2fsprogs pkgs.acl pkgs.gnused ];
+                serviceConfig = {
+                  Type = "oneshot";
+                  ExecStart = "${pkgs.bash}/bin/bash ${./portero/spool-layout.sh}";
+                };
+              };
+
+              systemd.services.gluck-portero-mint = {
+                after = [ "gluck-portero-spool-layout.service" ];
+                requires = [ "gluck-portero-spool-layout.service" ];
+              };
+
+              systemd.services.gluck-portero-intake = {
+                description = "gluck-portero-intake: the public signup spool's only writer";
+                after = [ "network.target" "gluck-portero-spool-layout.service" ];
+                requires = [ "gluck-portero-spool-layout.service" ];
                 wantedBy = [ "multi-user.target" ];
                 environment = {
                   PORT = toString cfg.intakePort;
