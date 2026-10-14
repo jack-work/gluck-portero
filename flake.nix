@@ -24,6 +24,7 @@
         cp ${./portero/mint.py}          $out/mint.py
         cp ${./portero/redeem.py}        $out/redeem.py
         cp ${./portero/intake.py}        $out/intake.py
+        cp ${./portero/journal.py}       $out/journal.py
       '';
 
       nixosModule =
@@ -620,7 +621,7 @@
 
             # Everything the units import must be present in the shipped tree.
             for m in invites.py spent.py budget.py spool.py pending_admin.py \
-                     mailer.py mint.py redeem.py intake.py; do
+                     mailer.py mint.py redeem.py intake.py journal.py; do
               test -f "$SRC/$m" || { echo "MISSING from shipped tree: $m"; exit 1; }
             done
 

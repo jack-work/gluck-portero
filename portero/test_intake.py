@@ -25,6 +25,7 @@ os.environ["PORTERO_RESPONSE_FLOOR"] = "0.05"
 
 sys.path.insert(0, _HERE)
 import intake as I  # noqa: E402
+import journal  # noqa: E402
 import spool  # noqa: E402
 
 
@@ -191,7 +192,7 @@ class Journal(Base):
         import io
         self.stream = io.StringIO()
         self.handler = logging.StreamHandler(self.stream)
-        self.handler.setFormatter(I.JournalFormatter())
+        self.handler.setFormatter(journal.JournalFormatter())
         I.log.addHandler(self.handler)
         I.log.setLevel(logging.INFO)
         self.real_fd = I.STORE._fd
