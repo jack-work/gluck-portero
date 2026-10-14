@@ -2,7 +2,7 @@
 """The spool: one file the public half can append to and do nothing else to.
 
 What stops the public half reading, truncating or overwriting it is the file's
-permissions, set by the module's tmpfiles rules, not anything in this code: its
+permissions, held by the module's layout unit, not anything in this code: its
 group reaches the file only through an ACL entry granting write, and the file is
 append-only (chattr +a). This class opens O_WRONLY|O_APPEND because append-only
 refuses any other write open. That the descriptor cannot read proves nothing on

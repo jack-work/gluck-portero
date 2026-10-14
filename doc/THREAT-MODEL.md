@@ -166,8 +166,8 @@ service ownership of the queue.
 | property | how, and who enforces it |
 |---|---|
 | cannot read back | the file's permissions. The spool is `root:portero-spool-reader`, owning group `r--`, which only mint holds, and an ACL entry gives `portero-intake` `-w-` and nothing more. Measured inside the real intake unit: `open(O_RDONLY)` is **EACCES** |
-| cannot truncate or overwrite | `chattr +a` from a tmpfiles `h` line. Inside the real unit: a write open without `O_APPEND` is **EPERM**, `ftruncate` is **EPERM**, and `pwrite` at offset zero appends instead of overwriting |
-| no ownership drift | the file is pre-created root-owned by tmpfiles, and neither service may create, rename or unlink it. `ReadWritePaths` names the **file**, so the public half cannot make or destroy anything in that directory |
+| cannot truncate or overwrite | `chattr +a`, held by `gluck-portero-spool-layout`. Inside the real unit: a write open without `O_APPEND` is **EPERM**, `ftruncate` is **EPERM**, and `pwrite` at offset zero appends instead of overwriting |
+| no ownership drift | `gluck-portero-spool-layout`, a root oneshot, is the file's one owner: it reads owner, mode, the full ACL and `+a`, changes nothing when they match, repairs and reads back when they differ, and fails when the read-back does not match. intake and mint `Requires=` it, and it runs on every activation, so a layout it cannot hold fails the deploy. Neither service may create, rename or unlink the file. `ReadWritePaths` names the **file**, so the public half cannot make or destroy anything in that directory |
 | the table is safe across a reboot | it lives in mint's own StateDirectory, which systemd re-chowns recursively at every start. That is the documented protection, applied rather than reimplemented |
 | one response | accepted, duplicate, malformed, flooded and full render the same bytes with the same status after the same floor |
 | never auto-sends | the unit holds no mail credential and does not import the mailer. The packaging check refuses a build where it does |
@@ -352,22 +352,31 @@ it, and each needs its revocation written down rather than assumed:
 
 | artifact | what a rollback does | the revocation |
 |---|---|---|
-| `/var/lib/gluck-portero-intake/spool.jsonl` | nothing. The addresses appended to it survive | `systemctl start gluck-portero-intake-reset`. tmpfiles recreates it root-owned if removed |
-| the spool's ACL entry and `chattr +a` | the previous release's tmpfiles rules reset owner, group and mode, but no rule removes an ACL or `+a`, so both stay. Signups keep flowing: measured in `checks.sandbox`, old mint reads and old intake appends. Only the old reset fails, safely, because `+a` refuses its truncate | the block below, run as root |
+| `/var/lib/gluck-portero-intake/spool.jsonl` | nothing. The addresses appended to it survive | `systemctl start gluck-portero-intake-reset`. The layout unit recreates it root-owned if removed |
+| the spool's owner, ACL entry and `chattr +a` | the previous release has no layout unit. Its tmpfiles `f` line cannot re-own a `+a` file: `fchownat` is EPERM, tmpfiles exits 73, and its unit counts 73 as success. The spool stays `root:portero-spool-reader`, so old mint cannot read it and **signups stall silently**: old intake still appends and the stalled signups land after the revocation. Measured in `checks.sandbox`. The old reset's truncate also fails | the numbered step below, run as root |
 | mint's `intake.db`, in its StateDirectory | nothing. Rows and decisions survive | `rm` it with mint stopped. The offset file beside it must go in the same breath |
 | a spent nonce | nothing. The INSERT already happened, so a redeemed link stays dead | none needed, and none wanted |
 | an account created by an approval, with its group | nothing. The user and the grant remain | `DELETE /invites/<username>` on the mint half, which deletes the account |
 
-The revocation for the spool's attributes after a rollback, copied verbatim
-from the command `checks.sandbox` runs:
+The revocation is a numbered step of every rollback past this change. Run it
+**before switching back** when the rollback is manual, and **immediately after**
+an automatic one: a layout that fails during activation fails the deploy, and
+deploy-rs then rolls back on its own. The block, as `checks.sandbox` runs it:
 
 ```sh
-systemctl stop gluck-portero-intake.service gluck-portero-mint.service && chattr -a /var/lib/gluck-portero-intake/spool.jsonl && setfacl -b /var/lib/gluck-portero-intake/spool.jsonl && chmod 0660 /var/lib/gluck-portero-intake/spool.jsonl && systemctl start gluck-portero-mint.service gluck-portero-intake.service
+systemctl stop gluck-portero-intake.service gluck-portero-mint.service && chattr -a /var/lib/gluck-portero-intake/spool.jsonl && setfacl -b /var/lib/gluck-portero-intake/spool.jsonl && chown root:portero-intake /var/lib/gluck-portero-intake/spool.jsonl && chmod 0660 /var/lib/gluck-portero-intake/spool.jsonl
 ```
 
-The `chmod` is not optional. `setfacl -b` keeps the base group entry, `r--`,
-so without it the mode falls to `0640` and the old intake loses its only write
-grant. The rig runs the block without it first and measures `EACCES`.
+Then switch back, or after an automatic rollback start both units. Acceptance:
+POST one signup to intake, then `GET /intake` on mint must list it.
+
+| part | why it is not optional |
+|---|---|
+| `chown` | the old tmpfiles line cannot do it while `+a` is set, and leaves the group `portero-spool-reader` |
+| `chmod` | `setfacl -b` keeps the base group entry, `r--`, so the mode falls to `0640` and old intake loses its only write grant |
+
+A failed layout does not stop a running intake or mint: `Requires=` keeps them
+from **starting**, so they keep serving the old layout until the rollback.
 
 So rolling spain back past this change removes the intake endpoint while leaving
 its table on disk. That is the harmless direction. The direction that matters is

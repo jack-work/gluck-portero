@@ -376,9 +376,6 @@
               users.groups.${intakeGroup} = { };
               users.groups.${readerGroup} = { };
 
-              # Both pre-created ROOT-OWNED, and neither service may create or
-              # remove them, so no dynamic user ever owns either one. A uid
-              # reassigned after a reboot therefore inherits nothing.
               systemd.tmpfiles.rules = [
                 "d ${cfg.intakeDirectory} 0711 root root -"
               ];

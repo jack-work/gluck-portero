@@ -116,7 +116,8 @@ guest before any rollback past the enforcement change.
 | intake | `127.0.0.1:9103`, one append to the spool and nothing else |
 
 The queue is two files in two places, deliberately. The **spool** lives at
-`/var/lib/gluck-portero-intake/spool.jsonl`, pre-created root-owned by tmpfiles
+`/var/lib/gluck-portero-intake/spool.jsonl`, created and held root-owned by the
+`gluck-portero-spool-layout` oneshot
 and reachable through the `portero-intake` group; the public half can append to
 that file and can neither read it nor create, rename or unlink anything beside
 it. The **table** lives in mint's own StateDirectory, which systemd re-chowns at
