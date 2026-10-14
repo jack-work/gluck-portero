@@ -695,6 +695,10 @@
             module = nixosModule;
             probe = ./portero/probe_spool.py;
           };
+          activation = import ./tests/activation.nix {
+            inherit pkgs;
+            module = nixosModule;
+          };
         });
     };
 }
