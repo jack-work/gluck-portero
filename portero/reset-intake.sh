@@ -6,8 +6,13 @@ SYSTEMCTL=${SYSTEMCTL:-systemctl}
 CHATTR=${CHATTR:-chattr}
 
 restore() {
-  "$CHATTR" +a -- "$PORTERO_SPOOL" || echo "could not restore append-only on the spool" >&2
-  "$SYSTEMCTL" start gluck-portero-mint.service gluck-portero-intake.service
+  if "$CHATTR" +a -- "$PORTERO_SPOOL"; then
+    "$SYSTEMCTL" start gluck-portero-mint.service gluck-portero-intake.service
+  else
+    echo "<3>append-only could not be restored on the intake spool; intake left stopped" >&2
+    "$SYSTEMCTL" start gluck-portero-mint.service
+    exit 1
+  fi
 }
 trap restore EXIT
 

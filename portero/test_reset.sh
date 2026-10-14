@@ -10,7 +10,7 @@ ROOT=$(mktemp -d)
 trap 'rm -rf "$ROOT"' EXIT
 
 printf '#!%s\necho "$*" >> "$CALLS"\n' "$(command -v bash)" > "$ROOT/systemctl"
-printf '#!%s\necho "chattr $*" >> "$CALLS"\n' "$(command -v bash)" > "$ROOT/chattr"
+printf '#!%s\necho "chattr $*" >> "$CALLS"\n[ "$1" = +a ] && [ -n "$FAIL_PLUS_A" ] && exit 1\nexit 0\n' "$(command -v bash)" > "$ROOT/chattr"
 chmod +x "$ROOT/systemctl" "$ROOT/chattr"
 
 fail() { echo "FAIL: $*" >&2; exit 1; }
@@ -56,6 +56,22 @@ say "a failed truncate fails the unit"
 start gluck-portero-mint.service gluck-portero-intake.service" ] \
   || fail "append-only not restored before the units came back: $(tr '\n' '|' < "$CALLS")"
 say "append-only restored, then both units started anyway"
+
+
+# If append-only cannot be restored, intake must not come back to a spool it
+# could truncate. Only mint starts, and the unit fails.
+: > "$CALLS"
+rm -rf "$PORTERO_SPOOL"
+printf '{"email":"a@x.com"}\n' > "$PORTERO_SPOOL"
+if FAIL_PLUS_A=1 bash "$SCRIPT" > "$ROOT/out" 2>&1; then
+  fail "a reset that could not restore append-only reported success"
+fi
+say "a failed +a fails the unit"
+[ "$(tail -1 "$CALLS")" = "start gluck-portero-mint.service" ] \
+  || fail "intake was started without append-only: $(tr '\n' '|' < "$CALLS")"
+grep -c "gluck-portero-intake.service" "$CALLS" | grep -qx 1 \
+  || fail "intake was started at some point: $(tr '\n' '|' < "$CALLS")"
+say "and only mint comes back"
 
 echo
 echo "one run stops, empties, removes and restarts, and restarts on failure."

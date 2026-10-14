@@ -198,8 +198,8 @@ packaging checks: 13 checks. `sandbox` is a VM test and needs KVM.
 | `intake` | accepted, duplicate, malformed, flooded and full render identical bytes **and none is measurably faster**; no route returns a row; the address reaches no log |
 | `integration` | the original loop against a real lldap: zero credential, single use |
 | `pipeline` | intake to mail to redemption against a real lldap **and a real SMTP server**, with the intake unit started with no credentials directory |
-| `reset` | the shipped reset script's order: stop, lift append-only, truncate, restore it, remove the offset, start; on failure, restore it before the units return; its last line is the netmon contract |
-| `sandbox` | a NixOS VM importing this module. Restores spain's old layout and requires the probe to read the spool; migrates the way activation does; probes **inside the real intake and mint units**; runs the real reset with the real `chattr`; drives a signup to mint; reboots and probes again |
+| `reset` | the shipped reset script's order: stop, lift append-only, truncate, restore it, remove the offset, start; on failure, restore it before the units return, and if it cannot be restored only mint returns; its last line is the netmon contract |
+| `sandbox` | a NixOS VM importing this module. Restores spain's old layout and requires the probe to read the spool; migrates the way activation does; probes **inside the real intake and mint units**; runs the real reset with the real `chattr`; drives a signup to mint; emulates a rollback and runs the revocation from the threat model; rolls forward; reboots and probes again |
 | `packaging` | all three entrypoints import out of the derivation the units execute, the shipped intake opens its spool append-only, and neither public half imports the mailer or sqlite |
 
 `./negative-controls.sh` is the suite that tests the tests: it breaks nine

@@ -35,6 +35,16 @@
           readerGroup = "portero-spool-reader";
           spoolFile = "${cfg.intakeDirectory}/spool.jsonl";
           offsetFile = "/var/lib/gluck-portero-mint/spool.offset";
+          groupsOf = svc:
+            lib.toList (svc.serviceConfig.SupplementaryGroups or [ ])
+            ++ lib.optional (svc.serviceConfig ? Group) svc.serviceConfig.Group;
+          readerHolders =
+            lib.attrNames (lib.filterAttrs (_: svc: lib.elem readerGroup (groupsOf svc))
+              config.systemd.services)
+            ++ map (u: "user ${u}") (lib.attrNames (lib.filterAttrs
+              (_: u: u.group == readerGroup || lib.elem readerGroup u.extraGroups)
+              config.users.users));
+          mintGroups = groupsOf config.systemd.services.gluck-portero-mint;
           py = pkgs.python3.withPackages (ps: with ps; [ flask waitress ]);
 
           # The entrypoints import sibling modules, so the package has to reach
@@ -451,6 +461,20 @@
                 {
                   assertion = cfg.minPasswordLength >= 10;
                   message = "gluck-portero: minPasswordLength below 10 is not acceptable.";
+                }
+                {
+                  assertion = readerHolders == [ "gluck-portero-mint" ];
+                  message =
+                    "gluck-portero: ${readerGroup} must be held by gluck-portero-mint and "
+                    + "nothing else, found: ${lib.concatStringsSep ", " readerHolders}. "
+                    + "Any holder can read every queued signup.";
+                }
+                {
+                  assertion = !(lib.elem intakeGroup mintGroups);
+                  message =
+                    "gluck-portero: gluck-portero-mint must not hold ${intakeGroup}. The "
+                    + "spool's read and write grants sit on different ACL entries, and a "
+                    + "process matching both could read and append.";
                 }
                 {
                   assertion = cfg.intakeRecordMax >= 2200;

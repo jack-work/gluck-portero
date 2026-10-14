@@ -353,9 +353,21 @@ it, and each needs its revocation written down rather than assumed:
 | artifact | what a rollback does | the revocation |
 |---|---|---|
 | `/var/lib/gluck-portero-intake/spool.jsonl` | nothing. The addresses appended to it survive | `systemctl start gluck-portero-intake-reset`. tmpfiles recreates it root-owned if removed |
+| the spool's ACL entry and `chattr +a` | the previous release's tmpfiles rules reset owner, group and mode, but no rule removes an ACL or `+a`, so both stay. Signups keep flowing: measured in `checks.sandbox`, old mint reads and old intake appends. Only the old reset fails, safely, because `+a` refuses its truncate | the block below, run as root |
 | mint's `intake.db`, in its StateDirectory | nothing. Rows and decisions survive | `rm` it with mint stopped. The offset file beside it must go in the same breath |
 | a spent nonce | nothing. The INSERT already happened, so a redeemed link stays dead | none needed, and none wanted |
 | an account created by an approval, with its group | nothing. The user and the grant remain | `DELETE /invites/<username>` on the mint half, which deletes the account |
+
+The revocation for the spool's attributes after a rollback, copied verbatim
+from the command `checks.sandbox` runs:
+
+```sh
+systemctl stop gluck-portero-intake.service gluck-portero-mint.service && chattr -a /var/lib/gluck-portero-intake/spool.jsonl && setfacl -b /var/lib/gluck-portero-intake/spool.jsonl && chmod 0660 /var/lib/gluck-portero-intake/spool.jsonl && systemctl start gluck-portero-mint.service gluck-portero-intake.service
+```
+
+The `chmod` is not optional. `setfacl -b` keeps the base group entry, `r--`,
+so without it the mode falls to `0640` and the old intake loses its only write
+grant. The rig runs the block without it first and measures `EACCES`.
 
 So rolling spain back past this change removes the intake endpoint while leaving
 its table on disk. That is the harmless direction. The direction that matters is
