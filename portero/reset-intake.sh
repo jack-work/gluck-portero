@@ -3,16 +3,25 @@ set -euo pipefail
 
 : "${PORTERO_SPOOL:?}" "${PORTERO_OFFSET:?}"
 SYSTEMCTL=${SYSTEMCTL:-systemctl}
+CHATTR=${CHATTR:-chattr}
 
-restart() {
-  "$SYSTEMCTL" start gluck-portero-mint.service gluck-portero-intake.service
+restore() {
+  if "$CHATTR" +a -- "$PORTERO_SPOOL"; then
+    "$SYSTEMCTL" start gluck-portero-mint.service gluck-portero-intake.service
+  else
+    echo "<3>append-only could not be restored on the intake spool; intake left stopped" >&2
+    "$SYSTEMCTL" start gluck-portero-mint.service
+    exit 1
+  fi
 }
-trap restart EXIT
+trap restore EXIT
 
 "$SYSTEMCTL" stop gluck-portero-intake.service
 "$SYSTEMCTL" stop gluck-portero-mint.service
 
+"$CHATTR" -a -- "$PORTERO_SPOOL"
 truncate -s 0 -- "$PORTERO_SPOOL"
+"$CHATTR" +a -- "$PORTERO_SPOOL"
 rm -f -- "$PORTERO_OFFSET"
 
 size=$(stat -c %s -- "$PORTERO_SPOOL")

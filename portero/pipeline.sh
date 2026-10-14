@@ -28,7 +28,7 @@ SMTP_PORT=33987
 ADMIN_PW=scratch-admin-password-2
 
 mkdir -p "$ROOT/creds" "$ROOT/state" "$ROOT/intake" "$ROOT/mint-state" "$ROOT/mail"
-# Pre-created the way tmpfiles pre-creates it on spain: neither service makes it.
+# Pre-created the way the layout unit creates it on spain: neither service makes it.
 : > "$ROOT/intake/spool.jsonl"
 cat > "$ROOT/cfg.toml" <<EOF
 ldap_host = "127.0.0.1"

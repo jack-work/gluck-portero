@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""The intake half. It appends an address to a write-only spool and nothing else.
+"""The intake half. It appends an address to the spool and nothing else.
 
-It holds no credential, reaches no directory, sends no mail, and **cannot read
-back what it has written**: the spool is opened O_WRONLY|O_APPEND, so a read on
-that descriptor fails with EBADF. That property is the kernel's rather than
-this file's, and it survives a future author who stops reading this comment.
+It holds no credential, reaches no directory and sends no mail. The spool's
+permissions, not this file, stop it reading back what it wrote: its group has
+write and nothing more on that file, through an ACL entry, and the file is
+append-only, so it cannot truncate or overwrite either. Opening the spool
+O_WRONLY|O_APPEND is what append-only demands, not the protection itself.
 
 The only effect a request can have is one append the caller never sees the
 outcome of: accepted, duplicate, malformed, flooded and full all render the same

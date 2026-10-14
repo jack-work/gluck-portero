@@ -33,8 +33,19 @@
           cfg = config.services.gluck-portero;
           setPasswordBin = "${pkgs.lldap}/bin/lldap_set_password";
           intakeGroup = "portero-intake";
+          readerGroup = "portero-spool-reader";
           spoolFile = "${cfg.intakeDirectory}/spool.jsonl";
           offsetFile = "/var/lib/gluck-portero-mint/spool.offset";
+          groupsOf = svc:
+            lib.toList (svc.serviceConfig.SupplementaryGroups or [ ])
+            ++ lib.optional (svc.serviceConfig ? Group) svc.serviceConfig.Group;
+          readerHolders =
+            lib.attrNames (lib.filterAttrs (_: svc: lib.elem readerGroup (groupsOf svc))
+              config.systemd.services)
+            ++ map (u: "user ${u}") (lib.attrNames (lib.filterAttrs
+              (_: u: u.group == readerGroup || lib.elem readerGroup u.extraGroups)
+              config.users.users));
+          mintGroups = groupsOf config.systemd.services.gluck-portero-mint;
           py = pkgs.python3.withPackages (ps: with ps; [ flask waitress ]);
 
           # The entrypoints import sibling modules, so the package has to reach
@@ -183,10 +194,10 @@
               type = lib.types.int;
               default = 1048576;
               description = ''
-                Ceiling in BYTES on the write-only spool the public half appends
+                Ceiling in BYTES on the append-only spool the public half writes
                 to. The public half enforces it with fstat on its own
-                descriptor, which is a size and not a read, so its blindness
-                survives the cap.
+                descriptor, which is a size and not a read, so the cap needs
+                no read access to the spool.
 
                 Nothing truncates the spool: a truncate from the consumer would
                 destroy any record appended between the read and the truncate,
@@ -315,7 +326,7 @@
                   "admin_password:${cfg.adminPasswordFile}"
                 ] ++ lib.optional (cfg.smtpPasswordFile != null)
                   "smtp_password:${cfg.smtpPasswordFile}";
-                SupplementaryGroups = [ intakeGroup ];
+                SupplementaryGroups = [ readerGroup ];
                 MemoryMax = "192M";
                 CPUQuota = "40%";
               };
@@ -363,23 +374,42 @@
 
             {
               users.groups.${intakeGroup} = { };
+              users.groups.${readerGroup} = { };
 
-              # Both pre-created ROOT-OWNED, and neither service may create or
-              # remove them, so no dynamic user ever owns either one. A uid
-              # reassigned after a reboot therefore inherits nothing.
               systemd.tmpfiles.rules = [
-                "d ${cfg.intakeDirectory} 0750 root ${intakeGroup} -"
-                "f ${spoolFile} 0660 root ${intakeGroup} -"
+                "d ${cfg.intakeDirectory} 0711 root root -"
               ];
 
-              systemd.services.gluck-portero-intake = {
-                description = "gluck-portero-intake: the public write-only signup spool";
+              systemd.services.gluck-portero-spool-layout = {
+                description = "gluck-portero: hold the intake spool's owner, mode, ACL and append-only flag";
                 after = [
-                  "network.target"
+                  "local-fs.target"
                   "systemd-tmpfiles-setup.service"
                   "systemd-tmpfiles-resetup.service"
                 ];
-                requires = [ "systemd-tmpfiles-setup.service" ];
+                before = [ "sysinit-reactivation.target" ];
+                requiredBy = [ "sysinit-reactivation.target" ];
+                environment = {
+                  PORTERO_SPOOL = spoolFile;
+                  PORTERO_READER_GROUP = readerGroup;
+                  PORTERO_WRITER_GROUP = intakeGroup;
+                };
+                path = [ pkgs.coreutils pkgs.e2fsprogs pkgs.acl pkgs.gnused ];
+                serviceConfig = {
+                  Type = "oneshot";
+                  ExecStart = "${pkgs.bash}/bin/bash ${./portero/spool-layout.sh}";
+                };
+              };
+
+              systemd.services.gluck-portero-mint = {
+                after = [ "gluck-portero-spool-layout.service" ];
+                requires = [ "gluck-portero-spool-layout.service" ];
+              };
+
+              systemd.services.gluck-portero-intake = {
+                description = "gluck-portero-intake: the public signup spool's only writer";
+                after = [ "network.target" "gluck-portero-spool-layout.service" ];
+                requires = [ "gluck-portero-spool-layout.service" ];
                 wantedBy = [ "multi-user.target" ];
                 environment = {
                   PORT = toString cfg.intakePort;
@@ -408,7 +438,7 @@
                   PORTERO_OFFSET = offsetFile;
                   SYSTEMCTL = "${pkgs.systemd}/bin/systemctl";
                 };
-                path = [ pkgs.coreutils ];
+                path = [ pkgs.coreutils pkgs.e2fsprogs ];
                 serviceConfig = {
                   Type = "oneshot";
                   ExecStart = "${pkgs.bash}/bin/bash ${./portero/reset-intake.sh}";
@@ -448,6 +478,20 @@
                 {
                   assertion = cfg.minPasswordLength >= 10;
                   message = "gluck-portero: minPasswordLength below 10 is not acceptable.";
+                }
+                {
+                  assertion = readerHolders == [ "gluck-portero-mint" ];
+                  message =
+                    "gluck-portero: ${readerGroup} must be held by gluck-portero-mint and "
+                    + "nothing else, found: ${lib.concatStringsSep ", " readerHolders}. "
+                    + "Any holder can read every queued signup.";
+                }
+                {
+                  assertion = !(lib.elem intakeGroup mintGroups);
+                  message =
+                    "gluck-portero: gluck-portero-mint must not hold ${intakeGroup}. The "
+                    + "spool's read and write grants sit on different ACL entries, and a "
+                    + "process matching both could read and append.";
                 }
                 {
                   assertion = cfg.intakeRecordMax >= 2200;
@@ -603,11 +647,13 @@
             import intake
             assert hasattr(intake, "offer"), "intake entrypoint incomplete"
             assert not hasattr(intake, "mailer"), "the public half imports a mailer"
-            # The claim upgrade, checked against the SHIPPED tree: the public
-            # half's handle on the spool cannot be read, by the kernel's rule.
+            # The shipped intake opens the spool write-only and append-only,
+            # which append-only (chattr +a) requires. This checks the
+            # descriptor only; whether the PROCESS can read is a matter of
+            # permissions, and checks.sandbox asks that inside the real unit.
             try:
                 os.read(intake.STORE._fd, 1)
-                raise AssertionError("the shipped intake half can READ its spool")
+                raise AssertionError("the shipped intake opened its spool readable")
             except OSError as exc:
                 assert exc.errno == 9, exc
             assert "sqlite3" not in sys.modules, "the public half opened sqlite"
@@ -641,6 +687,16 @@
             done
             echo "neither public half can send mail" | tee -a $out
           '';
+        } // nixpkgs.lib.optionalAttrs (system == "x86_64-linux") {
+          sandbox = import ./tests/spool-sandbox.nix {
+            inherit pkgs;
+            module = nixosModule;
+            probe = ./portero/probe_spool.py;
+          };
+          activation = import ./tests/activation.nix {
+            inherit pkgs;
+            module = nixosModule;
+          };
         });
     };
 }

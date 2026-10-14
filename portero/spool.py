@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
-"""The spool: one file the public half can append to and cannot read.
+"""The spool: one file the public half can append to and do nothing else to.
 
-Blindness is the kernel's, not the reviewer's. The writer opens O_WRONLY with
-O_APPEND and never holds a readable descriptor, so no code path, present or
-future, can read a submission back. A read() on that descriptor fails with
-EBADF.
+What stops the public half reading, truncating or overwriting it is the file's
+permissions, held by the module's layout unit, not anything in this code: its
+group reaches the file only through an ACL entry granting write, and the file is
+append-only (chattr +a). This class opens O_WRONLY|O_APPEND because append-only
+refuses any other write open. That the descriptor cannot read proves nothing on
+its own; a process with read permission could open a second one, and once could.
 
-The file is pre-created root-owned by tmpfiles and is never created, renamed or
-removed by either service, so no dynamic user ever owns it and a reboot that
-reassigns uids changes nothing. Appends and reads never contend: the consumer
+The file is pre-created root-owned and is never created, renamed or removed by
+either service, so no dynamic user ever owns it and a reboot that reassigns uids
+changes nothing. Appends and reads never contend: the consumer
 tracks a byte offset in its own StateDirectory and never writes here.
 """
 
@@ -29,7 +31,7 @@ ERROR = "error"
 
 
 class Spool:
-    """Append-only, write-only. Its cap is a size, which is not a read."""
+    """Appends records. Its cap is a size from fstat, which is not a read."""
 
     def __init__(self, path, max_bytes, record_max=RECORD_MAX):
         self.path = path
