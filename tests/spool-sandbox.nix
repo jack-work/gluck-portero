@@ -55,12 +55,13 @@ pkgs.testers.runNixOSTest {
     admin = "-H 'Remote-User: admin' -H 'Remote-Groups: portero-admin'"
     mint = "--unix-socket /run/kweb/gluck-portero-mint.sock http://mint"
 
-    def run_probe(unit, restart=True):
+    def run_probe(unit, restart=True, steps=None):
+        steps = steps or every
         d = f"/run/systemd/system/{unit}.service.d"
         m.succeed(f"mkdir -p {d}")
         m.succeed(
             f"printf '[Service]\\nType=oneshot\\nRestart=no\\nExecStart=\\n"
-            f"ExecStart={probe} {spool} {every}\\n' > {d}/probe.conf"
+            f"ExecStart={probe} {spool} {steps}\\n' > {d}/probe.conf"
         )
         m.succeed("systemctl daemon-reload")
         m.succeed(f"systemctl reset-failed {unit}.service")
@@ -75,7 +76,7 @@ pkgs.testers.runNixOSTest {
             m.wait_for_unit(f"{unit}.service")
         found = dict(re.findall(r"^PROBE (\S+) (\S+)", out, re.M))
         print(f"[{unit}] {found}")
-        assert len(found) == 5, f"probe did not report every step: {out}"
+        assert len(found) == len(steps.split()), f"probe did not report every step: {out}"
         return found
 
     def layout():
@@ -159,13 +160,39 @@ pkgs.testers.runNixOSTest {
         before = layout()
         m.succeed("systemctl restart systemd-tmpfiles-resetup.service")
         assert layout() == before, (before, layout())
+        m.fail("systemctl is-failed --quiet systemd-tmpfiles-resetup.service")
         signup_reaches_mint("second@example.com")
 
-    with subtest("rollback: the previous release's rules over the new file"):
+    with subtest("drift under this release's rules, MEASURED"):
+        # +a refuses chown to root. Whether it also refuses the chmod and the
+        # ACL write that tmpfiles performs when values DIFFER is measured here
+        # rather than assumed, along with whether the remedy restores the layout.
+        good = layout()
+        for name, drift in (
+            ("mode", f"chmod 0640 {spool}"),
+            ("acl", f"setfacl -x group:portero-intake {spool}"),
+        ):
+            m.succeed(f"chattr -a {spool} && {drift} && chattr +a {spool}")
+            code, out = m.execute("systemctl restart systemd-tmpfiles-resetup.service 2>&1")
+            failed = m.execute("systemctl is-failed --quiet systemd-tmpfiles-resetup.service")[0] == 0
+            journal = m.succeed("journalctl -o cat -u systemd-tmpfiles-resetup.service -n 5 --no-pager")
+            print(f"DRIFT {name}: restart exit {code}, unit failed {failed}, journal: {journal!r}")
+            print(f"DRIFT {name} layout after: {layout()!r}")
+            assert not failed, ("tmpfiles reports success even when it cannot repair", name)
+            assert "Operation not permitted" in journal, (name, journal)
+            assert layout() != good, ("expected the drift to persist", name)
+            m.succeed(f"chattr -a {spool}")
+            m.succeed("systemctl reset-failed systemd-tmpfiles-resetup.service")
+            m.succeed("systemctl restart systemd-tmpfiles-resetup.service")
+            assert layout() == good, (name, "remedy did not restore", layout(), good)
+            print(f"DRIFT {name}: remedy (chattr -a, re-run) restores the layout")
+
+    with subtest("rollback: the previous release's rules cannot re-own the spool"):
         # Emulates what a rollback to gluck-portero 27acc90 does to this file:
         # its two tmpfiles lines, verbatim, applied as systemd-tmpfiles-resetup
-        # applies them, and mint back in portero-intake, its old group. No old
-        # rule removes the ACL or +a, so both survive. Units are the real ones.
+        # applies them, and mint back in portero-intake, its old group. Units
+        # are the real ones. The previous release has no rule that clears +a,
+        # and +a refuses chown even to root.
         print(m.succeed("systemctl show -P ExecStart systemd-tmpfiles-resetup.service"))
         m.succeed(
             "printf '%s\\n' "
@@ -173,47 +200,52 @@ pkgs.testers.runNixOSTest {
             "'f /var/lib/gluck-portero-intake/spool.jsonl 0660 root portero-intake -' "
             "> /run/portero-rollback.conf"
         )
-        m.succeed("systemd-tmpfiles --create --remove /run/portero-rollback.conf")
+        code, out = m.execute("systemd-tmpfiles --create --remove /run/portero-rollback.conf 2>&1")
+        print(f"old rules: exit {code}: {out}")
+        assert code == 73 and "fchownat" in out and "Operation not permitted" in out, (code, out)
         print(layout())
-        m.succeed(f"stat -c '%a %U:%G' {spool} | grep -qx '660 root:portero-intake'")
-        m.succeed(f"getfacl -cp {spool} | grep -qx 'group:portero-intake:-w-'")
-        m.succeed(f"lsattr {spool} | cut -c1-22 | grep -q a")
+        m.succeed(f"stat -c '%U:%G' {spool} | grep -qx root:portero-spool-reader")
         d = "/run/systemd/system/gluck-portero-mint.service.d"
         m.succeed(f"mkdir -p {d}")
         m.succeed(f"printf '[Service]\\nSupplementaryGroups=\\nSupplementaryGroups=portero-intake\\n' > {d}/rollback.conf")
         m.succeed("systemctl daemon-reload && systemctl reset-failed gluck-portero-mint.service")
         m.succeed("systemctl restart gluck-portero-mint.service")
-        mint_after = run_probe("gluck-portero-mint")
-        assert mint_after["read"] == "OK", mint_after
-        intake_after = run_probe("gluck-portero-intake")
+        print("resetup SuccessExitStatus:", m.succeed("systemctl show -P SuccessExitStatus systemd-tmpfiles-resetup.service"))
+        mint_after = run_probe("gluck-portero-mint", steps="read append")
+        intake_after = run_probe("gluck-portero-intake", steps="read append")
+        print(f"after rollback: mint {mint_after} intake {intake_after}")
+        assert mint_after["read"] == "EACCES", ("old mint cannot read: signups stall", mint_after)
         assert intake_after["append"] == "OK", intake_after
-        assert intake_after["read"] == "OK", ("old layout: intake reads through the owning group", intake_after)
-        signup_reaches_mint("rolledback@example.com")
+        m.wait_until_succeeds("curl -fs http://127.0.0.1:9103/healthz")
+        m.wait_until_succeeds(f"curl -fs {mint}/healthz")
+        http = m.succeed(
+            "curl -s -o /dev/null -w '%{http_code}' -X POST http://127.0.0.1:9103/intake -d email=stalled@example.com"
+        )
+        assert http == "202", http
+        stalled = m.succeed(f"curl -fs {admin} {mint}/intake")
+        assert "stalled@example.com" not in stalled, ("expected a stall", stalled)
+        m.succeed(f"grep -q stalled@example.com {spool}")
         m.fail(f"truncate -s 0 {spool}")
 
-    with subtest("the revocation: setfacl -b alone would stall signups"):
-        m.succeed("systemctl stop gluck-portero-intake.service gluck-portero-mint.service")
-        m.succeed(f"chattr -a {spool} && setfacl -b {spool}")
-        m.succeed(f"stat -c %a {spool} | grep -qx 640")
-        m.succeed("systemctl start gluck-portero-mint.service")
-        stalled = run_probe("gluck-portero-intake", restart=False)
-        assert stalled["append"] == "EACCES", ("setfacl -b drops the group write", stalled)
-
-    with subtest("the revocation as the brief prints it: the old layout, whole"):
+    with subtest("the revocation BEFORE switching back: the old rules then apply cleanly, and the stalled signup lands"):
         m.succeed(
             "systemctl stop gluck-portero-intake.service gluck-portero-mint.service && "
-            f"chattr -a {spool} && setfacl -b {spool} && chmod 0660 {spool} && "
-            "systemctl start gluck-portero-mint.service gluck-portero-intake.service"
+            f"chattr -a {spool} && setfacl -b {spool} && chown root:portero-intake {spool} && chmod 0660 {spool}"
         )
+        code, out = m.execute("systemd-tmpfiles --create --remove /run/portero-rollback.conf 2>&1")
+        assert code == 0, ("after the revocation the old rules must apply cleanly", code, out)
+        m.succeed("systemctl start gluck-portero-mint.service gluck-portero-intake.service")
         print(layout())
         m.succeed(f"stat -c '%a %U:%G' {spool} | grep -qx '660 root:portero-intake'")
         m.succeed(f"test $(getfacl -cp {spool} | grep -c .) = 3")
         m.fail(f"lsattr {spool} | cut -c1-22 | grep -q a")
-        revoked = run_probe("gluck-portero-intake")
-        assert revoked["append"] == "OK", revoked
-        assert run_probe("gluck-portero-mint")["read"] == "OK"
+        m.wait_until_succeeds("curl -fs http://127.0.0.1:9103/healthz")
+        m.wait_until_succeeds(f"curl -fs {mint}/healthz")
+        landed = m.succeed(f"curl -fs {admin} {mint}/intake")
+        assert "stalled@example.com" in landed, ("the stall must defer, not lose", landed)
+        assert run_probe("gluck-portero-mint", steps="read")["read"] == "OK"
+        assert run_probe("gluck-portero-intake", steps="append")["append"] == "OK"
         m.succeed(f"truncate -s 0 {spool}")
-        signup_reaches_mint("revoked@example.com")
 
     with subtest("roll forward: this release's rules restore the new layout"):
         m.succeed(f"rm {d}/rollback.conf && systemctl daemon-reload")
@@ -233,6 +265,7 @@ pkgs.testers.runNixOSTest {
         m.wait_for_unit("gluck-portero-intake.service")
         m.wait_for_unit("gluck-portero-mint.service")
         print(layout())
+        m.fail("systemctl is-failed --quiet systemd-tmpfiles-setup.service")
         signup_reaches_mint("third@example.com")
         got = run_probe("gluck-portero-intake")
         assert got["read"] == "EACCES", got
