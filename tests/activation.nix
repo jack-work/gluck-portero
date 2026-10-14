@@ -141,7 +141,7 @@ pkgs.testers.runNixOSTest {
         n.succeed(f"systemctl reset-failed {L}")
         n.succeed(f"systemctl start {L}")
         n.succeed("journalctl --sync")
-        n.succeed(f"journalctl -u {L} -o cat | tail -1 | grep -q 'intake spool layout repaired'")
+        n.succeed(f"journalctl -u {L} -o cat | grep 'intake spool layout' | tail -1 | grep -q repaired")
         n.succeed(f"lsattr {spool} | cut -c1-22 | grep -q a")
         n.succeed(f"stat -c %a {spool} | grep -qx 660")
 
@@ -166,7 +166,7 @@ pkgs.testers.runNixOSTest {
         assert show(m, L, "InvocationID") != a["layout_inv"]
         m.succeed("journalctl --sync")
         print(m.succeed(f"journalctl -u {L} -o cat | tail -3"))
-        m.succeed(f"journalctl -u {L} -o cat | tail -2 | grep -q 'intake spool layout failed at'")
+        m.succeed(f"journalctl -u {L} -o cat | grep 'intake spool layout' | tail -1 | grep -q 'failed at'")
         print(f"after a failed switch: intake {show(m, I, 'ActiveState')} pid {show(m, I, 'MainPID')} (was {a['intake_pid']}), mint {show(m, M, 'ActiveState')} pid {show(m, M, 'MainPID')} (was {a['mint_pid']})")
         mend_layout(m)
   '';
