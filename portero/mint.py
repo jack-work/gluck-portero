@@ -111,7 +111,8 @@ def lldap_token():
 
 
 def gql(token, query, variables=None, tolerate=()):
-    """Run a GraphQL call. Raises on any error unless the message is tolerated.
+    """Run a GraphQL call. Raises on any error unless every error is tolerated
+    and the data carries nothing.
 
     lldap answers HTTP 200 with an "errors" key on failure, so a body has to be
     inspected rather than a status code trusted. Failing loudly is the default;
@@ -127,8 +128,11 @@ def gql(token, query, variables=None, tolerate=()):
     body = r.json()
     errors = body.get("errors")
     if errors:
-        messages = " ".join(str(e.get("message", "")) for e in errors)
-        if tolerate and any(t in messages for t in tolerate):
+        every_error_tolerated = all(
+            any(t in str(e.get("message", "")) for t in tolerate) for e in errors
+        )
+        data_is_empty = not any((body.get("data") or {}).values())
+        if tolerate and every_error_tolerated and data_is_empty:
             return None
         raise RuntimeError(f"graphql error: {errors}")
     return body["data"]

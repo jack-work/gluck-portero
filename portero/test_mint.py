@@ -827,5 +827,57 @@ class Retire(SendById):
         self.assertIn(f"INFO:portero-mint:intake row {rid} retired by admin, account dad gone", cap.output)
 
 
+class TolerateOnlyAPureAbsence(SendById):
+    """gql tolerates "Entity not found" only when it is the WHOLE answer:
+    every error is that one, and data carries nothing. A real error riding
+    alongside it must raise, or retire would close a live account's row."""
+
+    NOT_FOUND = {"message": "Entity not found: `dad`", "path": ["user"]}
+    DB_ERROR = {"message": "Database error: connection reset", "path": ["user"]}
+
+    def lldap_answers(self, body):
+        import requests as _rq
+
+        class Resp:
+            status_code = 200
+
+            @staticmethod
+            def raise_for_status():
+                return None
+
+            @staticmethod
+            def json():
+                return body
+
+        real_post, real_gql = _rq.post, M.gql
+        _rq.post = lambda url, **kw: Resp()
+        M.gql = REAL_GQL
+        self.addCleanup(setattr, _rq, "post", real_post)
+        self.addCleanup(setattr, M, "gql", real_gql)
+
+    def test_absence_plus_a_database_error_raises(self):
+        self.lldap_answers({"data": None, "errors": [self.NOT_FOUND, self.DB_ERROR]})
+        with self.assertRaises(RuntimeError):
+            M.user_exists("t", "dad")
+
+    def test_absence_with_a_user_in_data_raises(self):
+        self.lldap_answers({"data": {"user": {"id": "dad"}}, "errors": [self.NOT_FOUND]})
+        with self.assertRaises(RuntimeError):
+            M.user_exists("t", "dad")
+
+    def test_retire_fails_closed_on_the_mixed_answer(self):
+        rid = self.approved()
+        self.lldap_answers({"data": None, "errors": [self.NOT_FOUND, self.DB_ERROR]})
+        with self.assertRaises(RuntimeError):
+            self.call(f"/intake/{rid}/retire")
+        self.assertEqual(self.admin.get(rid)["state"], "approved")
+
+    def test_control_retire_proceeds_on_a_pure_absence(self):
+        rid = self.approved()
+        self.lldap_answers({"data": None, "errors": [self.NOT_FOUND]})
+        self.assertEqual(self.call(f"/intake/{rid}/retire").status_code, 200)
+        self.assertEqual(self.admin.get(rid)["state"], "retired")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
