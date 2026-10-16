@@ -380,6 +380,25 @@ def reject_intake(row_id):
     return jsonify(rejected=row_id), 200
 
 
+@app.post("/intake/<int:row_id>/retire")
+def retire_intake(row_id):
+    denied = forbidden()
+    if denied:
+        return denied
+    row = intake().get(row_id)
+    if row is None:
+        return jsonify(error="no such intake row"), 404
+    if row["state"] != "approved":
+        return jsonify(error=f"intake row is {row['state']}, not approved"), 409
+    username = row["username"]
+    if username and user_exists(lldap_token(), username):
+        return jsonify(error=f"the account still exists; DELETE /invites/{username} first"), 409
+    if not intake().retire(row_id):
+        return jsonify(error="intake row changed underneath; read it again"), 409
+    log.info("intake row %s retired by %s, account %s gone", row_id, caller(), username)
+    return jsonify(retired=row_id, username=username), 200
+
+
 @app.post("/intake/<int:row_id>/approve")
 def approve_intake(row_id):
     denied = forbidden()

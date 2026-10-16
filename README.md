@@ -56,7 +56,13 @@ curl -sS -X POST https://portero.kelliher.info/intake/7/approve \
   -d '{"username":"dad","site_access_groups":["site-files-access"]}'
 curl -sS -X POST https://portero.kelliher.info/intake/7/send      # mail it again
 curl -sS -X POST https://portero.kelliher.info/intake/7/reject    # or refuse
+curl -sS -X DELETE https://portero.kelliher.info/invites/dad      # revoke the account
+curl -sS -X POST https://portero.kelliher.info/intake/7/retire    # then close its row
 ```
+
+`retire` closes an approved row whose account is gone and clears its link
+material, so nothing can mail from it again. It refuses while the account
+exists: revocation is `DELETE /invites/<username>`, never a row edit.
 
 `approve` creates the credential-less account, grants site access, mints one
 link and mails it. `send` mails **the same link again**, rebuilt by re-signing

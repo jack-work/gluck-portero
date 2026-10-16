@@ -773,5 +773,59 @@ class IngestJournal(IntakeBase):
         self.assertEqual(body["spool_consumed"], -1)
 
 
+class Retire(SendById):
+    """An approved row whose account is gone can be retired. Retiring is
+    bookkeeping, never revocation: while the account exists it is refused."""
+
+    def test_retire_refuses_an_unauthenticated_caller_and_the_wrong_group(self):
+        rid = self.approved()
+        self.existing.discard("dad")
+        self.assertEqual(self.call(f"/intake/{rid}/retire", user=None).status_code, 401)
+        self.assertEqual(self.call(f"/intake/{rid}/retire", groups="files-admin").status_code, 403)
+        self.assertEqual(self.admin.get(rid)["state"], "approved")
+
+    def test_retire_refuses_while_the_account_exists(self):
+        rid = self.approved()
+        r = self.call(f"/intake/{rid}/retire")
+        self.assertEqual(r.status_code, 409)
+        self.assertIn("DELETE /invites/dad", r.get_json()["error"])
+        self.assertEqual(self.admin.get(rid)["state"], "approved")
+        self.assertIn("dad", self.existing)
+
+    def test_retire_after_revocation_makes_the_row_inert(self):
+        rid = self.approved()
+        self.assertEqual(self.c.delete("/invites/dad", headers={
+            "Remote-User": "admin", "Remote-Groups": "portero-admin"}).status_code, 200)
+        r = self.call(f"/intake/{rid}/retire")
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.get_json(), {"retired": rid, "username": "dad"})
+        row = self.admin.get(rid)
+        self.assertEqual(row["state"], "retired")
+        self.assertIsNone(row["nonce"])
+        self.assertEqual(self.call(f"/intake/{rid}/send").status_code, 409)
+        self.assertEqual(self.mailed, [])
+        self.assertEqual(self.admin.counts().get("approved"), None)
+        self.assertEqual(self.admin.counts()["retired"], 1)
+
+    def test_retire_refuses_a_pending_row_and_an_unknown_one(self):
+        rid = self.row("pending@example.com")
+        self.assertEqual(self.call(f"/intake/{rid}/retire").status_code, 409)
+        self.assertEqual(self.admin.get(rid)["state"], "pending")
+        self.assertEqual(self.call("/intake/99999/retire").status_code, 404)
+
+    def test_retire_happens_once(self):
+        rid = self.approved()
+        self.existing.discard("dad")
+        self.assertEqual(self.call(f"/intake/{rid}/retire").status_code, 200)
+        self.assertEqual(self.call(f"/intake/{rid}/retire").status_code, 409)
+
+    def test_retire_is_logged_with_who_and_which_account(self):
+        rid = self.approved()
+        self.existing.discard("dad")
+        with self.assertLogs("portero-mint", level="INFO") as cap:
+            self.call(f"/intake/{rid}/retire")
+        self.assertIn(f"INFO:portero-mint:intake row {rid} retired by admin, account dad gone", cap.output)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

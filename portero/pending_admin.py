@@ -42,7 +42,7 @@ CREATE TABLE IF NOT EXISTS intake (
 CREATE INDEX IF NOT EXISTS intake_state ON intake(state, id);
 """
 
-STATES = ("pending", "approved", "rejected")
+STATES = ("pending", "approved", "rejected", "retired")
 
 
 TABLE_FULL = "intake is full"
@@ -216,6 +216,15 @@ class IntakeAdmin:
                 "UPDATE intake SET state='rejected', decided_by=?, decided_at=? "
                 "WHERE id=? AND state='pending'",
                 (by, now, int(row_id)),
+            )
+            return cur.rowcount == 1
+
+    def retire(self, row_id):
+        with self._lock:
+            cur = self._db.execute(
+                "UPDATE intake SET state='retired', nonce=NULL, expires_at=NULL, mac=NULL "
+                "WHERE id=? AND state='approved'",
+                (int(row_id),),
             )
             return cur.rowcount == 1
 

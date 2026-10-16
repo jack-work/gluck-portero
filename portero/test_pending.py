@@ -334,5 +334,43 @@ class IngestOutcome(Base):
         self.assertLess(got.offset, os.path.getsize(self.spool_path))
 
 
+class Retire(Base):
+    """retire() moves an approved row whose account is gone to a terminal
+    state. It must never touch a pending or rejected row."""
+
+    def approved(self):
+        self.offer("dad@example.com")
+        rid = self.a.listing()[0]["id"]
+        self.assertTrue(self.a.claim(rid, "dad", "admin"))
+        self.a.record_claim_material(rid, "n" * 32, 2000000000, "m" * 64)
+        return rid
+
+    def test_an_approved_row_retires_and_loses_its_link_material(self):
+        rid = self.approved()
+        self.assertTrue(self.a.retire(rid))
+        row = self.a.get(rid)
+        self.assertEqual(row["state"], "retired")
+        self.assertEqual((row["nonce"], row["expires_at"], row["mac"]), (None, None, None))
+        self.assertEqual((row["username"], row["decided_by"]), ("dad", "admin"))
+
+    def test_a_pending_row_cannot_be_retired(self):
+        self.offer("dad@example.com")
+        rid = self.a.listing()[0]["id"]
+        self.assertFalse(self.a.retire(rid))
+        self.assertEqual(self.a.get(rid)["state"], "pending")
+
+    def test_a_rejected_row_cannot_be_retired(self):
+        self.offer("dad@example.com")
+        rid = self.a.listing()[0]["id"]
+        self.a.reject(rid, "admin")
+        self.assertFalse(self.a.retire(rid))
+        self.assertEqual(self.a.get(rid)["state"], "rejected")
+
+    def test_retire_happens_once(self):
+        rid = self.approved()
+        self.assertTrue(self.a.retire(rid))
+        self.assertFalse(self.a.retire(rid))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
