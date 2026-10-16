@@ -4,17 +4,23 @@
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
   inputs.gluck-service-lib.url = "github:jack-work/gluck-service-lib";
   inputs.gluck-service-lib.inputs.nixpkgs.follows = "nixpkgs";
+  inputs.zanni.url = "github:jack-work/zanni";
+  inputs.zanni.inputs.nixpkgs.follows = "nixpkgs";
 
   outputs =
-    { self, nixpkgs, gluck-service-lib, ... }:
+    { self, nixpkgs, gluck-service-lib, zanni, ... }:
     let
       # The runtime package, as a DIRECTORY. Shared by the module and by the
       # packaging check, deliberately: when the test built its own flat copy of
       # every .py file, it passed while production shipped one file and died on
       # `ModuleNotFoundError`. The check and the deploy now consume the same
       # derivation, so they cannot disagree about what ships.
-      porteroSrc = pkgs: pkgs.runCommand "gluck-portero-src" { } ''
+      porteroSrc = pkgs: pkgs.runCommand "gluck-portero-src" { nativeBuildInputs = [ pkgs.nodejs ]; } ''
         mkdir -p $out
+        z=${zanni.packages.${pkgs.stdenv.hostPlatform.system}.assets}
+        node -e "process.stdout.write(require('$z/fontpack/fontpack.gen.js').defs({ faces: 'display,prose,mono' }).replace(/<\\/?style>/g, String()))" > $out/zanni.css
+        cat $z/gesso/gesso.css $z/fontpack/fontpack.css >> $out/zanni.css
+        cp ${./portero/look.py}          $out/look.py
         cp ${./portero/invites.py}       $out/invites.py
         cp ${./portero/spent.py}         $out/spent.py
         cp ${./portero/budget.py}        $out/budget.py
@@ -557,6 +563,10 @@
             '';
           pending = suite "pending" "test_pending.py";
           intake = suite "intake" "test_intake.py";
+          look = pkgs.runCommand "portero-look" { } ''
+            set -o pipefail
+            PORTERO_SRC=${porteroSrc pkgs} ${py}/bin/python3 ${./portero/test_look.py} 2>&1 | tee $out
+          '';
 
           # mint as SHIPPED, under systemd-socket-activate, the mechanism the
           # platform socket uses.

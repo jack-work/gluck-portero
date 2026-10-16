@@ -24,6 +24,8 @@ import time
 
 from flask import Flask, Response, request
 
+import look
+
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import journal
 import spool
@@ -62,21 +64,6 @@ LEVELS = {
 }
 STORE = Spool(SPOOL_PATH, SPOOL_MAX, RECORD_MAX)
 
-PAGE = """<!doctype html><meta charset=utf-8>
-<meta name=viewport content="width=device-width,initial-scale=1">
-<meta name=referrer content=no-referrer>
-<title>{title}</title>
-<style>
- body{{font:16px/1.55 system-ui,sans-serif;max-width:27rem;margin:5rem auto;padding:0 1.2rem;color:#1b1b1b}}
- h1{{font-size:1.3rem;margin:0 0 .4rem}}
- p{{color:#555}} label{{display:block;margin:1.4rem 0 .3rem;font-weight:600}}
- input{{width:100%;padding:.6rem;font-size:1rem;border:1px solid #bbb;border-radius:4px}}
- button{{margin-top:1.4rem;padding:.6rem 1.1rem;font-size:1rem;border:0;border-radius:4px;background:#1b1b1b;color:#fff}}
-</style>
-<h1>{title}</h1>
-{body}
-"""
-
 FORM = """<p>Leave an email address and the owner of this site will decide
 whether to send you an invitation. Nothing is sent automatically.</p>
 <form method=post autocomplete=off>
@@ -94,15 +81,14 @@ help.</p>"""
 
 
 def page(title, body, status=200):
-    resp = Response(PAGE.format(title=title, body=body), status=status,
+    resp = Response(look.document(title, body), status=status,
                     mimetype="text/html; charset=utf-8")
     resp.headers["Referrer-Policy"] = "no-referrer"
     resp.headers["Cache-Control"] = "no-store, max-age=0"
     resp.headers["X-Content-Type-Options"] = "nosniff"
     resp.headers["X-Frame-Options"] = "DENY"
-    resp.headers["Content-Security-Policy"] = (
-        "default-src 'none'; style-src 'unsafe-inline'; form-action 'self'"
-    )
+    resp.headers["Content-Security-Policy"] = look.CSP
+    resp.vary.add("Cookie")
     return resp
 
 

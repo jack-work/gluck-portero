@@ -173,7 +173,10 @@ BOGUS=$(curl -s "http://127.0.0.1:$REDEEM_PORT/i/not-a-real-token")
   || { echo "FAIL: used and invalid tokens render differently" >&2; exit 1; }
 say "used and invalid are byte-identical" "OK"
 
-case "$USED" in *dad*) echo "FAIL: refusal names the user" >&2; exit 1 ;; esac
+# The page carries the faces as base64, where any short name can occur by
+# chance; the user can only be named in what the page says, outside <style>.
+SAID="${USED%%<style>*}${USED#*</style>}"
+case "$SAID" in *dad*) echo "FAIL: refusal names the user" >&2; exit 1 ;; esac
 say "refusal names no user" "OK"
 
 # the token must never reach a log
