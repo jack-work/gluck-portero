@@ -638,6 +638,21 @@
             PORTERO_SRC=${porteroSrc pkgs} ${py}/bin/python3 ${./portero/test_look.py} 2>&1 | tee $out
           '';
 
+          shots = pkgs.runCommand "portero-shots"
+            {
+              nativeBuildInputs = [ (pkgs.python3.withPackages (ps: with ps; [ flask waitress playwright ])) ];
+              PLAYWRIGHT_BROWSERS_PATH = pkgs.playwright-driver.browsers;
+              PLAYWRIGHT_SKIP_VALIDATE_HOST_REQUIREMENTS = "true";
+              FONTCONFIG_FILE = pkgs.makeFontsConf { fontDirectories = [ pkgs.dejavu_fonts ]; };
+            } ''
+              set -o pipefail
+              export HOME=$TMPDIR PORTERO_SRC=${porteroSrc pkgs}
+              export PORTERO_INTAKE_SPOOL=$TMPDIR/spool.jsonl PORTERO_RESPONSE_FLOOR=0.01
+              touch $PORTERO_INTAKE_SPOOL
+              mkdir -p $out
+              python3 ${./portero/shots.py} $out 2>&1 | tee $out/log
+            '';
+
           # mint as SHIPPED, under systemd-socket-activate, the mechanism the
           # platform socket uses.
           socket = pkgs.runCommand "portero-socket" { } ''
