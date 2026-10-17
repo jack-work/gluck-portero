@@ -502,7 +502,7 @@
                 if cfg.oidc.clientIds == [ ] then
                   { trustsRemoteHeaders = true; }
                 else
-                  { trustsRemoteHeadersOrBearer = true; };
+                  { trustsRemoteHeadersOrBearer = true; bearerClients = cfg.oidc.clientIds; };
 
               services.kelliher-web.sites.gluck-portero-redeem.extraConfig = ''
                 handle /intake* {
