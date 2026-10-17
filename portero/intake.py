@@ -64,8 +64,10 @@ LEVELS = {
 }
 STORE = Spool(SPOOL_PATH, SPOOL_MAX, RECORD_MAX)
 
-FORM = """<p>Leave an email address and the owner of this site will decide
-whether to send you an invitation. Nothing is sent automatically.</p>
+FORM = look.figaro(
+    "Leave your email address to request an account. "
+    "You will receive an email once the boss approves it."
+) + """
 <form method=post autocomplete=off>
  <label for=e>Email address</label>
  <input id=e name=email type=email maxlength="{maxemail}" required autofocus>
@@ -75,19 +77,20 @@ whether to send you an invitation. Nothing is sent automatically.</p>
 </form>
 """
 
-TAKEN = """<p>Thank you. If an invitation is sent, it will arrive by email.</p>
-<p style="font-size:.85rem">No reply is guaranteed, and asking twice does not
-help.</p>"""
+TAKEN = look.figaro(
+    "Thank you. If an invitation is sent, it will arrive by email."
+) + """
+<p class=aside>No reply is guaranteed, and asking twice does not help.</p>"""
 
 
 def page(title, body, status=200):
-    resp = Response(look.document(title, body), status=status,
+    resp = Response(look.stage(title, body), status=status,
                     mimetype="text/html; charset=utf-8")
     resp.headers["Referrer-Policy"] = "no-referrer"
     resp.headers["Cache-Control"] = "no-store, max-age=0"
     resp.headers["X-Content-Type-Options"] = "nosniff"
     resp.headers["X-Frame-Options"] = "DENY"
-    resp.headers["Content-Security-Policy"] = look.CSP
+    resp.headers["Content-Security-Policy"] = look.STAGE_CSP
     resp.vary.add("Cookie")
     return resp
 

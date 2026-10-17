@@ -10,6 +10,8 @@
   outputs =
     { self, nixpkgs, gluck-service-lib, zanni, ... }:
     let
+      heftSha256 = "723faf03ac87b616da82386c3759bd746d70b1a2a88cb63d33921a5447555408";
+
       # The runtime package, as a DIRECTORY. Shared by the module and by the
       # packaging check, deliberately: when the test built its own flat copy of
       # every .py file, it passed while production shipped one file and died on
@@ -20,6 +22,10 @@
         z=${zanni.packages.${pkgs.stdenv.hostPlatform.system}.assets}
         node -e "process.stdout.write(require('$z/fontpack/fontpack.gen.js').defs({ faces: 'display,prose,mono' }).replace(/<\\/?style>/g, String()))" > $out/zanni.css
         cat $z/gesso/gesso.css $z/fontpack/fontpack.css >> $out/zanni.css
+        echo "${heftSha256}  $z/heft/heft.js" | sha256sum -c --status \
+          || { echo "zanni's heft.js is not the one reviewed for the public intake page; read the change, then update heftSha256 in flake.nix" >&2; exit 1; }
+        cp $z/heft/heft.css $z/heft/heft.js $out/
+        cp ${./portero/figaro-head.png}  $out/figaro-head.png
         cp ${./portero/look.py}          $out/look.py
         cp ${./portero/invites.py}       $out/invites.py
         cp ${./portero/spent.py}         $out/spent.py
