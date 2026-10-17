@@ -148,10 +148,18 @@ class NoReadPath(Base):
         for body in seen:
             self.assertNotIn(b"secret@example.com", body)
 
-    def test_the_only_routes_are_the_form_the_submit_and_healthz(self):
+    def test_the_only_routes_are_the_form_the_submit_the_terms_and_healthz(self):
         rules = sorted(str(r) for r in I.app.url_map.iter_rules()
                        if not str(r).startswith("/static"))
-        self.assertEqual(rules, ["/healthz", "/intake", "/intake"])
+        self.assertEqual(rules, ["/healthz", "/intake", "/intake", "/terms"])
+
+    def test_the_terms_disclaim_liability_and_are_linked_from_both_pages(self):
+        body = self.c.get("/terms").get_data(as_text=True)
+        self.assertIn("as is, with no warranty", body)
+        self.assertIn("I am not liable for any loss, damage", body)
+        self.assertIn("I do not sell your data", body)
+        self.assertIn('<a href="/terms">Terms</a>', self.c.get("/intake").get_data(as_text=True))
+        self.assertIn('<a href="/terms">Terms</a>', self.offer().get_data(as_text=True))
 
     def test_figaro_says_glucks_words(self):
         body = self.c.get("/intake").get_data(as_text=True)

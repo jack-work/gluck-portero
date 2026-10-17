@@ -75,12 +75,27 @@ FORM = look.figaro(
  <input id=n name=note type=text maxlength="{maxnote}">
  <button type=submit>Ask for an invitation</button>
 </form>
+<p class=aside><a href="/terms">Terms</a></p>
 """
 
 TAKEN = look.figaro(
     "Thank you. If an invitation is sent, it will arrive by email."
 ) + """
-<p class=aside>No reply is guaranteed, and asking twice does not help.</p>"""
+<p class=aside>No reply is guaranteed, and asking twice does not help.</p>
+<p class=aside><a href="/terms">Terms</a></p>"""
+
+TERMS = look.figaro("The small print. The boss made me read it to everyone.") + """
+<p>This is a personal site, run by one person for family and friends. It is
+provided as is, with no warranty of any kind.</p>
+<p>You use it at your own risk. I am not liable for any loss, damage or other
+problem that comes from using it.</p>
+<p>I do not sell your data, and I use it for nothing beyond running the
+site.</p>
+<p>It is reasonably secure, but no site is perfectly secure, so use your own
+judgement.</p>
+<p>More to come.</p>
+<p class=aside><a href="/intake">Ask for an invitation</a></p>
+"""
 
 
 def page(title, body, status=200):
@@ -120,6 +135,11 @@ def record_outcome(outcome, errno_name=None):
 @app.get("/healthz")
 def healthz():
     return Response("ok\n", mimetype="text/plain")
+
+
+@app.get("/terms")
+def terms():
+    return page("Terms", TERMS)
 
 
 @app.get("/intake")

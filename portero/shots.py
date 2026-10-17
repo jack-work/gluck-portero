@@ -57,6 +57,10 @@ try:
                 back = head.bounding_box()
                 assert abs(back["x"] - box["x"]) < 1 and abs(back["y"] - box["y"]) < 1, (box, back)
 
+                pg.goto(U + "/terms")
+                expect(pg.get_by_text("I am not liable")).to_be_visible()
+                pg.screenshot(path=f"{OUT}/terms-{name}-{scheme}.png", full_page=True)
+                pg.goto(U + "/intake")
                 pg.fill("#e", "figaro@example.com")
                 pg.click("button[type=submit]")
                 expect(pg.get_by_text("Thank you. If an invitation is sent")).to_be_visible()

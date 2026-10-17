@@ -508,6 +508,9 @@
                 handle /intake* {
                   reverse_proxy localhost:${toString cfg.intakePort}
                 }
+                handle /terms {
+                  reverse_proxy localhost:${toString cfg.intakePort}
+                }
               '';
 
               assertions = [

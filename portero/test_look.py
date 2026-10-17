@@ -64,9 +64,10 @@ class Look(unittest.TestCase):
     def test_figaro_is_inline_and_draggable(self):
         import re
         _, body = self.get(None)
-        srcs = re.findall(r'(?:src|href)="([^"]*)"', body)
+        srcs = re.findall(r'src="([^"]*)"', body)
         self.assertEqual(len(srcs), 1)
         self.assertTrue(srcs[0].startswith("data:image/png;base64,"), srcs[0][:40])
+        self.assertEqual(re.findall(r'href="([^"]*)"', body), ["/terms"])
         self.assertIn('class="parla-head heft"', body)
         self.assertIn("data-parla", body)
         self.assertNotIn("style=", body)
