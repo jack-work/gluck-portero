@@ -996,5 +996,52 @@ class CrossSite(IntakeBase):
         self.assertEqual(self.c.post(f"/intake/{rid}/reject", json={}, headers=self.SESSION).status_code, 200)
 
 
+class Dashboard(IntakeBase):
+    """The dashboard is behind the same gate as the JSON it calls, and its
+    page may load nothing from off-origin."""
+
+    SESSION = {"Remote-User": "admin", "Remote-Groups": "portero-admin"}
+
+    def test_every_dashboard_path_refuses_no_identity_and_the_wrong_group(self):
+        for path in ("/admin", "/admin/config", "/admin/admin.js", "/admin/admin.css", "/admin/zanni.css"):
+            with self.subTest(path=path):
+                self.assertEqual(self.c.get(path).status_code, 401)
+                self.assertEqual(self.c.get(path, headers={"Remote-User": "x", "Remote-Groups": "files-admin"}).status_code, 403)
+                self.assertEqual(self.c.get(path, headers=dict(self.SESSION, Authorization="Bearer x")).status_code, 401)
+
+    def test_the_page_carries_a_csp_that_forbids_off_origin_loads(self):
+        r = self.c.get("/admin", headers=self.SESSION)
+        self.assertEqual(r.status_code, 200)
+        csp = r.headers["Content-Security-Policy"]
+        for directive in ("default-src 'none'", "script-src 'self'", "style-src 'self'", "connect-src 'self'",
+                          "form-action 'none'", "frame-ancestors 'none'", "base-uri 'none'"):
+            self.assertIn(directive, csp)
+        self.assertNotIn("unsafe", csp)
+        self.assertNotIn("http", csp)
+        self.assertEqual(r.headers["X-Content-Type-Options"], "nosniff")
+        page = r.get_data(as_text=True)
+        self.assertNotRegex(page, r"(src|href)=\"(https?:)?//", "the page references another origin")
+        self.assertNotIn("<script>", page, "inline script would need 'unsafe-inline'")
+
+    def test_assets_are_served_with_their_types_and_nothing_else_is(self):
+        for name, ctype in (("admin.js", "text/javascript"), ("admin.css", "text/css")):
+            r = self.c.get(f"/admin/{name}", headers=self.SESSION)
+            self.assertEqual(r.status_code, 200)
+            self.assertTrue(r.headers["Content-Type"].startswith(ctype))
+        for name in ("mint.py", "admin.html", "..%2Fmint.py", "intake.db", "test_mint.py"):
+            with self.subTest(name=name):
+                self.assertEqual(self.c.get(f"/admin/{name}", headers=self.SESSION).status_code, 404)
+
+    def test_the_script_writes_no_html(self):
+        js = open(os.path.join(os.path.dirname(os.path.abspath(M.__file__)), "admin.js")).read()
+        for sink in ("innerHTML", "outerHTML", "insertAdjacentHTML", "document.write", "eval(", "new Function"):
+            self.assertNotIn(sink, js)
+        self.assertNotRegex(js, r"https?://", "the script names another origin")
+
+    def test_config_lists_the_grantable_groups(self):
+        body = self.c.get("/admin/config", headers=self.SESSION).get_json()
+        self.assertEqual(body, {"user": "admin", "grantable": M.GRANTABLE})
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

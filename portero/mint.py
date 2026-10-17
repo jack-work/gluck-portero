@@ -299,6 +299,59 @@ def provision(username, email, display_name, ttl, groups):
     )
 
 
+HERE = os.path.dirname(os.path.abspath(__file__))
+ADMIN_ASSETS = {
+    "admin.js": "text/javascript; charset=utf-8",
+    "admin.css": "text/css; charset=utf-8",
+    "zanni.css": "text/css; charset=utf-8",
+}
+ADMIN_CSP = (
+    "default-src 'none'; script-src 'self'; style-src 'self'; font-src data:; "
+    "img-src 'self' data:; connect-src 'self'; base-uri 'none'; form-action 'none'; "
+    "frame-ancestors 'none'"
+)
+
+
+def admin_file(name, content_type):
+    try:
+        with open(os.path.join(HERE, name), "rb") as fh:
+            body = fh.read()
+    except FileNotFoundError:
+        return jsonify(error="not found"), 404
+    return body, 200, {
+        "Content-Type": content_type,
+        "Content-Security-Policy": ADMIN_CSP,
+        "X-Content-Type-Options": "nosniff",
+        "Referrer-Policy": "no-referrer",
+    }
+
+
+@app.get("/admin")
+def admin_page():
+    denied = forbidden()
+    if denied:
+        return denied
+    return admin_file("admin.html", "text/html; charset=utf-8")
+
+
+@app.get("/admin/config")
+def admin_config():
+    denied = forbidden()
+    if denied:
+        return denied
+    return jsonify(user=caller(), grantable=GRANTABLE)
+
+
+@app.get("/admin/<name>")
+def admin_asset(name):
+    denied = forbidden()
+    if denied:
+        return denied
+    if name not in ADMIN_ASSETS:
+        return jsonify(error="not found"), 404
+    return admin_file(name, ADMIN_ASSETS[name])
+
+
 @app.post("/invites")
 def create_invite():
     denied = forbidden()
