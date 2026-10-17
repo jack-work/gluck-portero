@@ -22,7 +22,10 @@ def _shipped(name, mode="r"):
 ZANNI = _shipped("zanni.css")
 HEFT_CSS = _shipped("heft.css")
 HEFT_JS = _shipped("heft.js")
+PARLA_CSS = _shipped("parla.css")
+PARLA_JS = _shipped("parla.js")
 FIGARO_HEAD = "data:image/png;base64," + base64.b64encode(_shipped("figaro-head.png", "rb")).decode()
+SCRIPTS = [js for js in (HEFT_JS, PARLA_JS) if js]
 
 STYLE = """
 :root{color-scheme:light dark}
@@ -54,18 +57,12 @@ def document(title, body):
     )
 
 
-FIGARO_STYLE = """
-.figaro{display:flex;align-items:flex-start;gap:1.2rem;margin:.4rem 0 1.4rem}
-.figaro-head{flex:none;width:104px;height:104px;box-sizing:border-box;image-rendering:pixelated;border:3px solid light-dark(#a2762a,#d9a94e);background:#e7d4c4}
-.bubble{position:relative;flex:1;margin:.2rem 0 0;padding:.75rem 1rem;font:19px/1.45 var(--fontpack-prose,Georgia,serif);color:var(--z-ink);background:var(--z-ground-2);border:2px solid var(--z-ink);border-radius:14px}
-.bubble::before,.bubble::after{content:"";position:absolute;border-style:solid;border-color:transparent}
-.bubble::before{left:-16px;top:56px;border-width:8px 16px 8px 0;border-right-color:var(--z-ink)}
-.bubble::after{left:-12px;top:58px;border-width:6px 13px 6px 0;border-right-color:var(--z-ground-2)}
+PAGE_STYLE = """
 .aside{font-size:.85rem}
-@media (min-width:640px){body{max-width:31rem}.figaro-head{width:130px;height:130px}.bubble::before{top:71px}.bubble::after{top:73px}}
+@media (min-width:640px){body{max-width:31rem}}
 """
 
-STAGE_STYLE = ZANNI + STYLE + FIGARO_STYLE + HEFT_CSS
+STAGE_STYLE = ZANNI + STYLE + PAGE_STYLE + HEFT_CSS + PARLA_CSS
 
 
 def _sha256(text):
@@ -74,26 +71,26 @@ def _sha256(text):
 
 STAGE_CSP = "; ".join(
     ["default-src 'none'", f"style-src {_sha256(STAGE_STYLE)}", "img-src data:"]
-    + ([f"script-src {_sha256(HEFT_JS)}"] if HEFT_JS else [])
+    + (["script-src " + " ".join(_sha256(js) for js in SCRIPTS)] if SCRIPTS else [])
     + ["font-src data:", "form-action 'self'"]
 )
 
 
 def figaro(says):
     return (
-        '<div class="figaro">'
-        f'<img class="figaro-head heft" src="{FIGARO_HEAD}" alt="Figaro" draggable="false">'
-        f'<p class="bubble">{says}</p></div>'
+        '<div class="parla" data-parla>'
+        f'<img class="parla-head heft" src="{FIGARO_HEAD}" alt="Figaro" draggable="false">'
+        f'<p class="parla-bubble">{says}</p></div>'
     )
 
 
 def stage(title, body):
-    script = f"<script>{HEFT_JS}</script>\n" if HEFT_JS else ""
+    scripts = "".join(f"<script>{js}</script>\n" for js in SCRIPTS)
     return (
         f"<!doctype html><html lang=en{scheme_attr()}><meta charset=utf-8>\n"
         '<meta name=viewport content="width=device-width,initial-scale=1">\n'
         "<meta name=referrer content=no-referrer>\n"
         f"<title>{title}</title>\n"
         f"<style>{STAGE_STYLE}</style>\n"
-        f'<body class="gesso">\n<h1>{title}</h1>\n{body}\n{script}'
+        f'<body class="gesso">\n<h1>{title}</h1>\n{body}\n{scripts}'
     )

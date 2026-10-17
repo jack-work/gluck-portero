@@ -36,13 +36,13 @@ try:
                 pg.on("console", lambda m: refused.append(m.text) if "Content Security Policy" in m.text or "Refused" in m.text else None)
 
                 pg.goto(U + "/intake")
-                expect(pg.locator(".bubble")).to_be_visible()
+                expect(pg.locator(".parla-bubble")).to_be_visible()
                 pg.evaluate("document.fonts.ready")
                 faces[f"{name}-{scheme}"] = pg.evaluate(
                     "[...document.fonts].filter(f => f.status === 'loaded').map(f => f.family.replace(/[\"']/g, ''))")
                 pg.screenshot(path=f"{OUT}/intake-{name}-{scheme}.png", full_page=True)
 
-                head = pg.locator(".figaro-head")
+                head = pg.locator(".parla-head")
                 box = head.bounding_box()
                 cx, cy = box["x"] + box["width"] / 2, box["y"] + box["height"] / 2
                 pg.mouse.move(cx, cy)

@@ -11,6 +11,7 @@
     { self, nixpkgs, gluck-service-lib, zanni, ... }:
     let
       heftSha256 = "723faf03ac87b616da82386c3759bd746d70b1a2a88cb63d33921a5447555408";
+      parlaSha256 = "99bba62eb6ad26ca449154dff4abe35ca3d8cc423ba76300e1c885de3f8af2f1";
 
       # The runtime package, as a DIRECTORY. Shared by the module and by the
       # packaging check, deliberately: when the test built its own flat copy of
@@ -22,10 +23,9 @@
         z=${zanni.packages.${pkgs.stdenv.hostPlatform.system}.assets}
         node -e "process.stdout.write(require('$z/fontpack/fontpack.gen.js').defs({ faces: 'display,prose,mono' }).replace(/<\\/?style>/g, String()))" > $out/zanni.css
         cat $z/gesso/gesso.css $z/fontpack/fontpack.css >> $out/zanni.css
-        echo "${heftSha256}  $z/heft/heft.js" | sha256sum -c --status \
-          || { echo "zanni's heft.js is not the one reviewed for the public intake page; read the change, then update heftSha256 in flake.nix" >&2; exit 1; }
-        cp $z/heft/heft.css $z/heft/heft.js $out/
-        cp ${./portero/figaro-head.png}  $out/figaro-head.png
+        printf '%s  %s\n' ${heftSha256} $z/heft/heft.js ${parlaSha256} $z/parla/parla.js | sha256sum -c --status \
+          || { echo "zanni's heft.js or parla.js is not the one reviewed for the public intake page; read the change, then update its sha256 in flake.nix" >&2; exit 1; }
+        cp $z/heft/heft.css $z/heft/heft.js $z/parla/parla.css $z/parla/parla.js $z/parla/figaro-head.png $out/
         cp ${./portero/look.py}          $out/look.py
         cp ${./portero/invites.py}       $out/invites.py
         cp ${./portero/spent.py}         $out/spent.py

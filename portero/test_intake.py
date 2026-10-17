@@ -155,7 +155,7 @@ class NoReadPath(Base):
 
     def test_figaro_says_glucks_words(self):
         body = self.c.get("/intake").get_data(as_text=True)
-        self.assertIn('<p class="bubble">Leave your email address to request an account. '
+        self.assertIn('<p class="parla-bubble">Leave your email address to request an account. '
                       "You will receive an email once the boss approves it.</p>", body)
 
     def test_the_form_is_the_same_page_whatever_is_stored(self):
