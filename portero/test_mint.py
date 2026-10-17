@@ -32,6 +32,7 @@ os.environ["PORTERO_INTAKE_CAP"] = "8"
 sys.path.insert(0, _HERE)
 import invites  # noqa: E402
 import mailer  # noqa: E402
+import oidc  # noqa: E402
 import mint as M  # noqa: E402
 import spool  # noqa: E402
 
@@ -877,6 +878,122 @@ class TolerateOnlyAPureAbsence(SendById):
         self.lldap_answers({"data": None, "errors": [self.NOT_FOUND]})
         self.assertEqual(self.call(f"/intake/{rid}/retire").status_code, 200)
         self.assertEqual(self.admin.get(rid)["state"], "retired")
+
+
+class Bearer(IntakeBase):
+    """Identity comes from the Authorization header whenever one is present,
+    and a failing token is refused: never a fall back to Remote-*, never
+    anonymous. Caddy strips Remote-* on the bearer branch; these tests send
+    forged Remote-* anyway, so mint is not relying on that."""
+
+    FORGED = {"Remote-User": "admin", "Remote-Groups": "portero-admin"}
+
+    class StandIn:
+        def __init__(self, outcome):
+            self.outcome = outcome
+
+        def verify(self, authorization):
+            if isinstance(self.outcome, Exception):
+                raise self.outcome
+            return self.outcome
+
+    def gate(self, outcome):
+        real = M.GATE
+        M.GATE = self.StandIn(outcome)
+        self.addCleanup(setattr, M, "GATE", real)
+
+    def reject(self, rid, authorization, extra=None):
+        headers = dict(self.FORGED, Authorization=authorization)
+        headers.update(extra or {})
+        return self.c.post(f"/intake/{rid}/reject", headers=headers)
+
+    def test_garbage_bearer_with_forged_identity_is_401_and_reaches_no_handler(self):
+        rid = self.row()
+        r = self.reject(rid, "Bearer x")
+        self.assertEqual(r.status_code, 401)
+        self.assertEqual(self.admin.get(rid)["state"], "pending")
+
+    def test_any_authorization_header_disables_remote_headers(self):
+        rid = self.row()
+        for value in ("Basic YWRtaW46eA==", "", "Bearer", "bearer abc"):
+            with self.subTest(value=value):
+                self.assertEqual(self.reject(rid, value).status_code, 401)
+        self.assertEqual(self.admin.get(rid)["state"], "pending")
+
+    def test_a_refused_token_is_401_even_with_forged_identity(self):
+        self.gate(oidc.Refused("token was issued to client 'keel'"))
+        rid = self.row()
+        self.assertEqual(self.reject(rid, "Bearer abc").status_code, 401)
+        self.assertEqual(self.admin.get(rid)["state"], "pending")
+
+    def test_an_unavailable_identity_provider_is_503(self):
+        self.gate(oidc.Unavailable("userinfo status 500"))
+        rid = self.row()
+        self.assertEqual(self.reject(rid, "Bearer abc").status_code, 503)
+        self.assertEqual(self.admin.get(rid)["state"], "pending")
+
+    def test_a_valid_token_from_a_non_operator_is_403(self):
+        self.gate(oidc.Identity("mallory", ["files-user"], "u-9", "portero-cli"))
+        rid = self.row()
+        self.assertEqual(self.reject(rid, "Bearer abc").status_code, 403)
+        self.assertEqual(self.admin.get(rid)["state"], "pending")
+
+    def test_a_valid_operator_token_acts_as_its_own_user_not_the_forged_one(self):
+        self.gate(oidc.Identity("gluck", ["portero-admin"], "u-1", "portero-cli"))
+        rid = self.row()
+        self.assertEqual(self.reject(rid, "Bearer abc").status_code, 200)
+        self.assertEqual(self.admin.get(rid)["decided_by"], "gluck")
+
+    def test_a_bearer_post_needs_no_json_content_type(self):
+        self.gate(oidc.Identity("gluck", ["portero-admin"], "u-1", "portero-cli"))
+        rid = self.row()
+        r = self.c.post(f"/intake/{rid}/reject", headers={"Authorization": "Bearer abc"})
+        self.assertEqual(r.status_code, 200)
+
+    def test_whoami_says_how_the_caller_was_identified(self):
+        self.gate(oidc.Identity("gluck", ["portero-admin"], "u-1", "portero-cli"))
+        body = self.c.get("/invites/whoami", headers={"Authorization": "Bearer abc"}).get_json()
+        self.assertEqual(body, {"user": "gluck", "groups": ["portero-admin"], "via": "bearer"})
+        body = self.c.get("/invites/whoami", headers=self.FORGED).get_json()
+        self.assertEqual(body["via"], "session")
+
+    def test_the_shipped_gate_refuses_every_bearer_when_unconfigured(self):
+        self.assertFalse(M.GATE.configured)
+        rid = self.row()
+        self.assertEqual(self.reject(rid, "Bearer abc").status_code, 401)
+
+
+class CrossSite(IntakeBase):
+    """A session POST must be application/json, which a cross-site form
+    cannot send without a preflight, and must not carry a foreign Origin."""
+
+    SESSION = {"Remote-User": "admin", "Remote-Groups": "portero-admin"}
+
+    def test_a_form_post_is_refused_and_does_nothing(self):
+        rid = self.row()
+        for ctype in ("application/x-www-form-urlencoded", "multipart/form-data; boundary=x", "text/plain", None):
+            with self.subTest(ctype=ctype):
+                headers = dict(self.SESSION)
+                if ctype:
+                    headers["Content-Type"] = ctype
+                r = self.c.post(f"/intake/{rid}/reject", headers=headers, data="x=1")
+                self.assertEqual(r.status_code, 415)
+        self.assertEqual(self.admin.get(rid)["state"], "pending")
+
+    def test_a_foreign_origin_is_refused(self):
+        rid = self.row()
+        r = self.c.post(f"/intake/{rid}/reject", json={}, headers=dict(self.SESSION, Origin="https://files.kelliher.info"))
+        self.assertEqual(r.status_code, 403)
+        self.assertEqual(self.admin.get(rid)["state"], "pending")
+
+    def test_same_origin_json_is_accepted(self):
+        rid = self.row()
+        r = self.c.post(f"/intake/{rid}/reject", json={}, headers=dict(self.SESSION, Origin=M.ORIGIN))
+        self.assertEqual(r.status_code, 200)
+
+    def test_json_without_origin_is_accepted(self):
+        rid = self.row()
+        self.assertEqual(self.c.post(f"/intake/{rid}/reject", json={}, headers=self.SESSION).status_code, 200)
 
 
 if __name__ == "__main__":

@@ -20,12 +20,13 @@ import threading
 import time
 
 import requests
-from flask import Flask, jsonify, request
+from flask import Flask, g as per_request, jsonify, request
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import invites
 import journal
 import mailer
+import oidc
 import pending_admin
 from pending_admin import IntakeAdmin, mac_fields
 
@@ -45,6 +46,13 @@ INTAKE_SPOOL = os.environ.get(
 )
 INTAKE_CAP = int(os.environ.get("PORTERO_INTAKE_CAP", "200"))
 INGEST_SECONDS = float(os.environ.get("PORTERO_INGEST_SECONDS", "60"))
+ORIGIN = os.environ.get("PORTERO_ORIGIN", "https://portero.kelliher.info")
+GATE = oidc.BearerGate(
+    issuer=os.environ.get("PORTERO_OIDC_ISSUER", ""),
+    jwks_url=os.environ.get("PORTERO_OIDC_JWKS_URL", ""),
+    userinfo_url=os.environ.get("PORTERO_OIDC_USERINFO_URL", ""),
+    client_ids=os.environ.get("PORTERO_OIDC_CLIENT_IDS", "").split(","),
+)
 
 USERNAME_RE = re.compile(r"^[a-z][a-z0-9_-]{2,31}$")
 # lldap owns the uniqueness of an address, enforced by a database constraint.
@@ -91,13 +99,35 @@ def intake():
         return _intake
 
 
+def identity():
+    if "portero_identity" in per_request:
+        return per_request.portero_identity
+    if "Authorization" in request.headers:
+        try:
+            who = GATE.verify(request.headers["Authorization"])
+        except oidc.Refused as exc:
+            log.warning("bearer refused: %s", exc)
+            who = (401, "bearer token refused")
+        except oidc.Unavailable as exc:
+            log.error("bearer check unavailable: %s", exc)
+            who = (503, "identity provider unavailable")
+    else:
+        user = request.headers.get("Remote-User", "")
+        raw = request.headers.get("Remote-Groups", "")
+        groups = [x.strip() for x in raw.split(",") if x.strip()]
+        who = oidc.Identity(user, groups, user, None) if user else (401, "unauthenticated")
+    per_request.portero_identity = who
+    return who
+
+
 def caller():
-    return request.headers.get("Remote-User", "")
+    who = identity()
+    return who.username if isinstance(who, oidc.Identity) else ""
 
 
 def caller_groups():
-    raw = request.headers.get("Remote-Groups", "")
-    return [g.strip() for g in raw.split(",") if g.strip()]
+    who = identity()
+    return list(who.groups) if isinstance(who, oidc.Identity) else []
 
 
 def lldap_token():
@@ -170,15 +200,30 @@ def healthz():
 
 @app.get("/invites/whoami")
 def whoami():
-    return jsonify(user=caller(), groups=caller_groups())
+    who = identity()
+    if not isinstance(who, oidc.Identity):
+        return jsonify(error=who[1]), who[0]
+    return jsonify(user=who.username, groups=list(who.groups), via="bearer" if who.client_id else "session")
+
+
+def cross_site():
+    if request.method != "POST" or "Authorization" in request.headers:
+        return None
+    if request.mimetype != "application/json":
+        return jsonify(error="a session POST must be application/json"), 415
+    origin = request.headers.get("Origin")
+    if origin is not None and origin != ORIGIN:
+        return jsonify(error="cross-origin request refused"), 403
+    return None
 
 
 def forbidden():
-    if not caller():
-        return jsonify(error="unauthenticated"), 401
-    if REQUIRED_GROUP not in caller_groups():
+    who = identity()
+    if not isinstance(who, oidc.Identity):
+        return jsonify(error=who[1]), who[0]
+    if REQUIRED_GROUP not in who.groups:
         return jsonify(error=f"requires group {REQUIRED_GROUP}"), 403
-    return None
+    return cross_site()
 
 
 def invalid(username, email, ttl, groups):
