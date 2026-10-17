@@ -40,8 +40,27 @@ curl -sS https://portero.kelliher.info/invites \
 
 The response carries the URL once. It is not stored and cannot be re-read.
 
-There is **no CLI yet**. This is a browser-session or `curl` interface, and the
-gated hostname means a session is required either way.
+Three ways in, all to the same JSON endpoints on the gated hostname:
+
+| way | identity |
+|---|---|
+| the `portero` CLI | an OIDC access token from Authelia's `portero-cli` client, held by hush |
+| the dashboard, `https://portero.kelliher.info/admin` | an Authelia browser session |
+| `curl` with a session | the same; every session POST must be `application/json` |
+
+mint takes identity from the token whenever an `Authorization` header is
+present and from Remote-* otherwise, never both. A token is honoured only for
+the `portero-cli` client, and its groups are read from Authelia's userinfo per
+request (cached 60 s), so removing someone from `portero-admin` takes effect
+within a minute even though Authelia does not re-check a refresh. Any failure
+is a refusal: 401 for a bad token, 503 when Authelia cannot be asked. The
+Caddy side is kelliher-web's `trustsRemoteHeadersOrBearer` site mode.
+
+```bash
+nix profile install github:jack-work/gluck-portero#portero
+portero login                 # device flow; hush keeps and refreshes the token
+portero intake                # pending signups; --all for every state, --json for JSON
+```
 
 ## Inviting at scale: the intake pipeline
 
@@ -49,16 +68,15 @@ Someone asks for an account at `invite.kelliher.info/intake`. Nothing is sent,
 nothing is created, and the page says the same thing whatever happened.
 
 ```bash
-# what the operator does, on the gated hostname
-curl -sS https://portero.kelliher.info/intake                     # list pending
-curl -sS -X POST https://portero.kelliher.info/intake/7/approve \
-  -H 'Content-Type: application/json' \
-  -d '{"username":"dad","site_access_groups":["site-files-access"]}'
-curl -sS -X POST https://portero.kelliher.info/intake/7/send      # mail it again
-curl -sS -X POST https://portero.kelliher.info/intake/7/reject    # or refuse
-curl -sS -X DELETE https://portero.kelliher.info/invites/dad      # revoke the account
-curl -sS -X POST https://portero.kelliher.info/intake/7/retire    # then close its row
+portero intake                                             # list pending
+portero approve 7 dad --sites site-files-access --name Dad  # account + invite mail
+portero send 7                                             # mail it again
+portero reject 7                                           # or refuse
+portero retire 7                                           # close a row whose account is gone
 ```
+
+Deleting an account is the dashboard's "Delete account", or
+`DELETE /invites/<username>`.
 
 `retire` closes an approved row whose account is gone and clears its link
 material, so nothing can mail from it again. It refuses while the account

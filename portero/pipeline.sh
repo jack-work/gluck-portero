@@ -65,10 +65,10 @@ expect() {
   say "$what" "$got OK"
 }
 code() { curl -s -o /dev/null -w '%{http_code}' "$@"; }
-admin() { curl -s -H 'Remote-User: admin' -H 'Remote-Groups: portero-admin' "$@"; }
+admin() { curl -s -H 'Remote-User: admin' -H 'Remote-Groups: portero-admin' -H 'Content-Type: application/json' "$@"; }
 admin_code() {
   curl -s -o /dev/null -w '%{http_code}' \
-    -H 'Remote-User: admin' -H 'Remote-Groups: portero-admin' "$@"
+    -H 'Remote-User: admin' -H 'Remote-Groups: portero-admin' -H 'Content-Type: application/json' "$@"
 }
 mail_count() { ls "$ROOT/mail" | wc -l | tr -d ' '; }
 sql() { sqlite3 "$ROOT/mint-state/intake.db" "$1"; }
@@ -190,7 +190,6 @@ print([r['id'] for r in rows if r['email'] == 'dad@example.com'][0])")
 
 # ── approve, which creates the account and mails the link ────────────────
 admin -X POST "http://127.0.0.1:$MINT_PORT/intake/$RID/approve" \
-  -H 'Content-Type: application/json' \
   -d '{"username":"dad","site_access_groups":["site-files-access"],"ttl_seconds":3600}' \
   > "$ROOT/approve.json"
 grep -q '"mailed": *true' "$ROOT/approve.json" || fail "approve did not mail: $(cat "$ROOT/approve.json")"
@@ -275,14 +274,12 @@ expect "replay the mailed link" 404 "$(code "$URL")"
 BEFORE_ROWS=$(sql "SELECT COUNT(*) || ':' || SUM(state='approved') FROM intake")
 expect "a second account for one address is 409" 409 \
   "$(admin_code -X POST "http://127.0.0.1:$MINT_PORT/invites" \
-      -H 'Content-Type: application/json' \
       -d '{"username":"dadtwo","email":"dad@example.com","ttl_seconds":3600}')"
 expect "the intake table did not move" "$BEFORE_ROWS" \
   "$(sql "SELECT COUNT(*) || ':' || SUM(state='approved') FROM intake")"
 
 # ── a GET flood must not spend the endpoint, and must not spend a nonce ──
 admin -X POST "http://127.0.0.1:$MINT_PORT/invites" \
-  -H 'Content-Type: application/json' \
   -d '{"username":"mum","email":"mum@example.com","ttl_seconds":3600}' \
   > "$ROOT/invite2.json"
 URL3=$(python3 -c "import json;print(json.load(open('$ROOT/invite2.json'))['url'])")

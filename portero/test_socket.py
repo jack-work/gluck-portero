@@ -93,7 +93,8 @@ class Socket(unittest.TestCase):
     def test_underscore_forms_are_not_believed(self):
         for name in ("Remote_User", "remote_user"):
             status, body = whoami([(name, "forged-admin")])
-            self.assertEqual(status, 200, name)
+            self.assertEqual(status, 401, name)
+            self.assertIn(b"unauthenticated", body, name)
             self.assertNotIn(b"forged-admin", body, name)
 
     def test_no_tcp_listener(self):

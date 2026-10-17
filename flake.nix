@@ -30,6 +30,10 @@
         cp ${./portero/mint.py}          $out/mint.py
         cp ${./portero/redeem.py}        $out/redeem.py
         cp ${./portero/intake.py}        $out/intake.py
+        cp ${./portero/oidc.py}          $out/oidc.py
+        cp ${./portero/admin.html}       $out/admin.html
+        cp ${./portero/admin.js}         $out/admin.js
+        cp ${./portero/admin.css}        $out/admin.css
         cp ${./portero/journal.py}       $out/journal.py
       '';
 
@@ -185,6 +189,36 @@
               '';
             };
 
+            oidc = {
+              issuer = lib.mkOption {
+                type = lib.types.str;
+                default = "";
+                example = "https://auth.kelliher.info";
+                description = "Issuer bearer tokens must carry. Empty refuses every bearer token.";
+              };
+              jwksUrl = lib.mkOption {
+                type = lib.types.str;
+                default = "";
+                example = "http://127.0.0.1:9091/jwks.json";
+                description = "Where mint reads the issuer's signing keys.";
+              };
+              userinfoUrl = lib.mkOption {
+                type = lib.types.str;
+                default = "";
+                example = "http://127.0.0.1:9091/api/oidc/userinfo";
+                description = "Where mint reads a token holder's groups, per request, cached 60 s.";
+              };
+              clientIds = lib.mkOption {
+                type = lib.types.listOf lib.types.str;
+                default = [ ];
+                example = [ "portero-cli" ];
+                description = ''
+                  The only OIDC clients whose tokens mint honours. Empty keeps
+                  mint on Remote-* alone, and the site on trustsRemoteHeaders.
+                '';
+              };
+            };
+
             intakeRecordMax = lib.mkOption {
               type = lib.types.int;
               default = 4096;
@@ -305,7 +339,7 @@
               requireAuth = true;
               requiredGroups = [ cfg.requiredGroup ];
               entrypoint = "${src}/mint.py";
-              pythonPackages = ps: with ps; [ flask waitress requests ];
+              pythonPackages = ps: with ps; [ flask waitress requests pyjwt cryptography ];
               stateDirectory = "gluck-portero-mint";
               environment = {
                 PORTERO_LISTEN = "socket";
@@ -318,6 +352,13 @@
                 PORTERO_INTAKE_OFFSET = offsetFile;
                 PORTERO_INTAKE_SPOOL_MAX = toString cfg.intakeSpoolMax;
                 PORTERO_INTAKE_CAP = toString cfg.intakeCap;
+                PORTERO_ORIGIN = "https://${cfg.mintSubdomain}.${
+                  lib.head config.services.kelliher-web.baseDomains
+                }";
+                PORTERO_OIDC_ISSUER = cfg.oidc.issuer;
+                PORTERO_OIDC_JWKS_URL = cfg.oidc.jwksUrl;
+                PORTERO_OIDC_USERINFO_URL = cfg.oidc.userinfoUrl;
+                PORTERO_OIDC_CLIENT_IDS = lib.concatStringsSep "," cfg.oidc.clientIds;
                 PORTERO_SMTP_HOST = cfg.smtpHost;
                 PORTERO_SMTP_PORT = toString cfg.smtpPort;
                 PORTERO_SMTP_USER = lib.optionalString (cfg.smtpPasswordFile != null) cfg.smtpUser;
@@ -451,7 +492,11 @@
                 };
               };
 
-              services.kelliher-web.sites.gluck-portero-mint.trustsRemoteHeaders = true;
+              services.kelliher-web.sites.gluck-portero-mint =
+                if cfg.oidc.clientIds == [ ] then
+                  { trustsRemoteHeaders = true; }
+                else
+                  { trustsRemoteHeadersOrBearer = true; };
 
               services.kelliher-web.sites.gluck-portero-redeem.extraConfig = ''
                 handle /intake* {
@@ -536,15 +581,28 @@
       nixosModules.default = nixosModule;
       nixosModules.gluck-portero = nixosModule;
 
+      packages = forAllSystems (system:
+        let
+          pkgs = nixpkgs.legacyPackages.${system};
+          portero = pkgs.runCommand "portero" { meta.mainProgram = "portero"; } ''
+            mkdir -p $out/bin
+            { echo "#!${pkgs.python3}/bin/python3"; cat ${./cli/portero.py}; } > $out/bin/portero
+            chmod +x $out/bin/portero
+          '';
+        in {
+          inherit portero;
+          default = portero;
+        });
+
       checks = forAllSystems (system:
         let
           pkgs = nixpkgs.legacyPackages.${system};
-          py = pkgs.python3.withPackages (ps: with ps; [ flask waitress requests ]);
+          py = pkgs.python3.withPackages (ps: with ps; [ flask waitress requests pyjwt cryptography ]);
           suite = name: file: pkgs.runCommand "portero-${name}" { } ''
             # pipefail is load-bearing: without it the pipeline reports tee's
             # exit status and a failing test builds green.
             set -o pipefail
-            cp ${./portero}/*.py .
+            cp ${./portero}/*.py ${./portero}/admin.html ${./portero}/admin.js ${./portero}/admin.css .
             ${py}/bin/python3 ${file} 2>&1 | tee $out
           '';
         in {
@@ -562,6 +620,12 @@
               bash ${./portero/test_reset.sh} ${./portero/reset-intake.sh} 2>&1 | tee $out
             '';
           pending = suite "pending" "test_pending.py";
+          oidc = suite "oidc" "test_oidc.py";
+          cli = pkgs.runCommand "portero-cli-tests" { } ''
+            set -o pipefail
+            cp ${./cli}/*.py .
+            ${py}/bin/python3 test_cli.py 2>&1 | tee $out
+          '';
           intake = suite "intake" "test_intake.py";
           look = pkgs.runCommand "portero-look" { } ''
             set -o pipefail
@@ -627,7 +691,7 @@
             SRC=${porteroSrc pkgs}
 
             # Everything the units import must be present in the shipped tree.
-            for m in invites.py spent.py budget.py spool.py pending_admin.py \
+            for m in invites.py spent.py budget.py spool.py pending_admin.py oidc.py admin.html admin.js admin.css \
                      mailer.py mint.py redeem.py intake.py journal.py; do
               test -f "$SRC/$m" || { echo "MISSING from shipped tree: $m"; exit 1; }
             done
