@@ -1043,5 +1043,37 @@ class Dashboard(IntakeBase):
         self.assertEqual(body, {"user": "admin", "grantable": M.GRANTABLE})
 
 
+
+class BearerLogLine(unittest.TestCase):
+    """A kid comes from the unsigned token header and PyJWT echoes it into the
+    refusal. Logged raw, a newline in it starts a second journal record that
+    can impersonate a real event; the refusal must stay one line."""
+
+    def setUp(self):
+        import test_oidc as O
+        self.O = O
+        self.idp = O.IdP()
+        self.saved = M.GATE
+        M.GATE = oidc.BearerGate(issuer=O.ISSUER, jwks_url=self.idp.url + "/jwks.json",
+                                 userinfo_url=self.idp.url + "/userinfo",
+                                 client_ids=["portero-cli"])
+        M.app.config["TESTING"] = True
+        self.c = M.app.test_client()
+
+    def tearDown(self):
+        M.GATE = self.saved
+        self.idp.close()
+
+    def test_a_kid_carrying_a_forged_record_is_logged_as_one_line(self):
+        forged = "x\nINFO invite minted for forged by admin, groups [], nonce 0, expires 0"
+        with self.assertLogs(M.log, level="WARNING") as seen:
+            r = self.c.get("/intake", headers={"Authorization": self.O.token(kid=forged)})
+        self.assertEqual(r.status_code, 401)
+        refusals = [m for m in seen.output if "bearer refused" in m]
+        self.assertEqual(len(refusals), 1, seen.output)
+        self.assertNotIn("\n", refusals[0])
+        self.assertIn("forged by admin", refusals[0])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

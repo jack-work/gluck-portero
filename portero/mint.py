@@ -106,10 +106,10 @@ def identity():
         try:
             who = GATE.verify(request.headers["Authorization"])
         except oidc.Refused as exc:
-            log.warning("bearer refused: %s", exc)
+            log.warning("bearer refused: %r", str(exc))
             who = (401, "bearer token refused")
         except oidc.Unavailable as exc:
-            log.error("bearer check unavailable: %s", exc)
+            log.error("bearer check unavailable: %r", str(exc))
             who = (503, "identity provider unavailable")
     else:
         user = request.headers.get("Remote-User", "")
