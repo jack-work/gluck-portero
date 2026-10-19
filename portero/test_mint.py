@@ -825,7 +825,7 @@ class Retire(SendById):
         self.existing.discard("dad")
         with self.assertLogs("portero-mint", level="INFO") as cap:
             self.call(f"/intake/{rid}/retire")
-        self.assertIn(f"INFO:portero-mint:intake row {rid} retired by admin, account dad gone", cap.output)
+        self.assertIn(f"INFO:portero-mint:intake row {rid} retired by 'admin', account 'dad' gone", cap.output)
 
 
 class TolerateOnlyAPureAbsence(SendById):
@@ -1003,11 +1003,16 @@ class Dashboard(IntakeBase):
     SESSION = {"Remote-User": "admin", "Remote-Groups": "portero-admin"}
 
     def test_every_dashboard_path_refuses_no_identity_and_the_wrong_group(self):
-        for path in ("/admin", "/admin/config", "/admin/admin.js", "/admin/admin.css", "/admin/zanni.css"):
+        for path in ("/", "/admin", "/admin/config", "/admin/admin.js", "/admin/admin.css", "/admin/zanni.css"):
             with self.subTest(path=path):
                 self.assertEqual(self.c.get(path).status_code, 401)
                 self.assertEqual(self.c.get(path, headers={"Remote-User": "x", "Remote-Groups": "files-admin"}).status_code, 403)
                 self.assertEqual(self.c.get(path, headers=dict(self.SESSION, Authorization="Bearer x")).status_code, 401)
+
+    def test_the_root_sends_an_admin_to_the_dashboard(self):
+        r = self.c.get("/", headers=self.SESSION)
+        self.assertEqual(r.status_code, 302)
+        self.assertEqual(r.headers["Location"], "/admin")
 
     def test_the_page_carries_a_csp_that_forbids_off_origin_loads(self):
         r = self.c.get("/admin", headers=self.SESSION)
@@ -1042,6 +1047,25 @@ class Dashboard(IntakeBase):
         body = self.c.get("/admin/config", headers=self.SESSION).get_json()
         self.assertEqual(body, {"user": "admin", "grantable": M.GRANTABLE})
 
+
+
+class CallerLogLine(IntakeBase):
+    """A caller's name comes from userinfo. Logged raw, a newline in it starts
+    a second journal record that can impersonate a real event."""
+
+    def test_a_caller_name_carrying_a_forged_record_is_logged_as_one_line(self):
+        forged = "admin\nINFO invite minted for forged by admin, groups [], nonce 0, expires 0"
+        real = M.GATE
+        M.GATE = Bearer.StandIn(oidc.Identity(forged, ["portero-admin"], forged, "portero-cli"))
+        self.addCleanup(setattr, M, "GATE", real)
+        rid = self.row()
+        with self.assertLogs(M.log, level="INFO") as seen:
+            r = self.c.post(f"/intake/{rid}/reject", headers={"Authorization": "Bearer abc"})
+        self.assertEqual(r.status_code, 200)
+        rejections = [m for m in seen.output if "rejected by" in m]
+        self.assertEqual(len(rejections), 1, seen.output)
+        self.assertNotIn("\n", rejections[0])
+        self.assertIn("forged by admin", rejections[0])
 
 
 class BearerLogLine(unittest.TestCase):

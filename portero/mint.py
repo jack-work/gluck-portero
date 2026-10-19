@@ -20,7 +20,7 @@ import threading
 import time
 
 import requests
-from flask import Flask, g as per_request, jsonify, request
+from flask import Flask, g as per_request, jsonify, redirect, request
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import invites
@@ -268,7 +268,7 @@ def provision(username, email, display_name, ttl, groups):
     except RuntimeError as exc:
         if EMAIL_TAKEN not in str(exc):
             raise
-        log.info("refused %s: the address already belongs to an account", username)
+        log.info("refused %r: the address already belongs to an account", username)
         return {"error": "that email address already belongs to an account"}, 409
 
     # Granting site access at mint time is safe BECAUSE the account has no
@@ -284,7 +284,7 @@ def provision(username, email, display_name, ttl, groups):
 
     invite, nonce, expires_at = invites.mint(SIGNING_KEY, username, ttl)
     log.info(
-        "invite minted for %s by %s, groups %s, nonce %s, expires %s",
+        "invite minted for %r by %r, groups %s, nonce %s, expires %s",
         username, caller(), sorted(group_ids), nonce, expires_at,
     )
     return (
@@ -324,6 +324,14 @@ def admin_file(name, content_type):
         "X-Content-Type-Options": "nosniff",
         "Referrer-Policy": "no-referrer",
     }
+
+
+@app.get("/")
+def root():
+    denied = forbidden()
+    if denied:
+        return denied
+    return redirect("/admin", 302)
 
 
 @app.get("/admin")
@@ -396,7 +404,7 @@ def revoke(username):
     if not user_exists(token, username):
         return jsonify(error="no such user"), 404
     gql(token, "mutation($id:String!){deleteUser(userId:$id){ok}}", {"id": username})
-    log.info("account %s deleted by %s", username, caller())
+    log.info("account %r deleted by %r", username, caller())
     return jsonify(deleted=username), 200
 
 
@@ -414,10 +422,10 @@ def deliver(row_id, email, url, expires_at, username):
     try:
         mailer.send_invite(email, url, expires_at)
     except mailer.MailFailed as exc:
-        log.error("invite mail failed for %s: %s", username, exc)
+        log.error("invite mail failed for %r: %r", username, str(exc))
         return str(exc)
     intake().record_sent(row_id)
-    log.info("invite mailed to %s for %s by %s", email, username, caller())
+    log.info("invite mailed to %r for %r by %r", email, username, caller())
     return None
 
 
@@ -478,7 +486,7 @@ def reject_intake(row_id):
         return denied
     if not intake().reject(row_id, caller()):
         return jsonify(error="no pending intake row with that id"), 409
-    log.info("intake row %s rejected by %s", row_id, caller())
+    log.info("intake row %s rejected by %r", row_id, caller())
     return jsonify(rejected=row_id), 200
 
 
@@ -497,7 +505,7 @@ def retire_intake(row_id):
         return jsonify(error=f"the account still exists; DELETE /invites/{username} first"), 409
     if not intake().retire(row_id):
         return jsonify(error="intake row changed underneath; read it again"), 409
-    log.info("intake row %s retired by %s, account %s gone", row_id, caller(), username)
+    log.info("intake row %s retired by %r, account %r gone", row_id, caller(), username)
     return jsonify(retired=row_id, username=username), 200
 
 
@@ -584,7 +592,7 @@ def send_intake(row_id):
              "nonce": nonce, "expires_at": expires_at},
         )
         intake().record_claim_material(row_id, nonce, expires_at, mac)
-        log.info("intake row %s re-minted for %s, nonce %s", row_id, username, nonce)
+        log.info("intake row %s re-minted for %r, nonce %s", row_id, username, nonce)
     else:
         token = invites.sign(SIGNING_KEY, username, expires_at, nonce)
 
