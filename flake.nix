@@ -758,8 +758,8 @@
             assert "pending_admin" not in sys.modules, "the public half imports the table"
             routes = sorted(str(r) for r in intake.app.url_map.iter_rules()
                             if not str(r).startswith("/static"))
-            assert routes == ["/healthz", "/intake", "/intake"], routes
-            print("intake imports and serves three routes with no credential")
+            assert routes == ["/healthz", "/intake", "/intake", "/terms"], routes
+            print("intake imports and serves its four routes with no credential")
             PY
 
             CREDENTIALS_DIRECTORY=$creds STATE_DIRECTORY=$state \
