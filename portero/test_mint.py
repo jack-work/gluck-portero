@@ -1045,7 +1045,7 @@ class Dashboard(IntakeBase):
 
     def test_config_lists_the_grantable_groups(self):
         body = self.c.get("/admin/config", headers=self.SESSION).get_json()
-        self.assertEqual(body, {"user": "admin", "grantable": M.GRANTABLE})
+        self.assertEqual(body, {"user": "admin", "grantable": M.GRANTABLE, "umbral": False})
 
 
 

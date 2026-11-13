@@ -2,6 +2,7 @@
 
 const $ = (id) => document.getElementById(id);
 let grantable = [];
+let umbral = false;
 
 function el(tag, attrs, ...children) {
   const node = document.createElement(tag);
@@ -113,6 +114,72 @@ function decidedRow(r) {
       el("span", { class: "meta", text: `#${r.id} · by ${r.decided_by || "?"} · ${when(r.decided_at)}` })));
 }
 
+function umbralRow(r) {
+  const user = el("input", { type: "text", placeholder: "username", size: "16", value: suggest(r.email) });
+  const boxes = grantable.map((g) => el("input", { type: "checkbox", value: g, id: `u-${r.id}-${g}` }));
+  const approve = el("button", { text: "Approve" });
+  const reject = el("button", { class: "quiet", text: "Reject" });
+  approve.addEventListener("click", () => act(approve, "approve", "POST", `/umbral/requests/${r.id}/approve`, {
+    username: user.value.trim(),
+    display_name: r.name,
+    site_access_groups: boxes.filter((b) => b.checked).map((b) => b.value),
+  }, (d) => `approved ${d.username}` + (d.mailed ? ", told by mail" : `, mail FAILED: ${d.mail_error}`)));
+  reject.addEventListener("click", () => {
+    if (confirm(`Reject ${r.email}?`)) act(reject, "reject", "POST", `/umbral/requests/${r.id}/reject`, {}, () => `rejected #${r.id}`);
+  });
+  const groups = boxes.map((b, i) => el("label", { for: b.id }, b, " " + grantable[i]));
+  const label = r.provider === "google" ? "Google" : "GitHub";
+  return el("div", { class: "row" },
+    el("div", { class: "head" },
+      el("span", { class: "email", text: r.email }),
+      el("span", { text: `${r.name} · ${label} subject ${r.subject}` + (r.hd ? ` · hd ${r.hd}` : "") }),
+      el("span", { class: "meta", text: `#${r.id} · ${when(r.received_at)}` })),
+    r.workspace_warning ? el("div", { class: "note err", text: r.workspace_warning }) : null,
+    r.claims_existing.length ? el("div", { class: "note err", text: `claims an existing address: ${r.claims_existing.join(", ")}. Never approve this to link; that account's holder links at login.kelliher.info/link.` }) : null,
+    r.note ? el("div", { class: "note", text: r.note }) : null,
+    el("div", { class: "fields" }, user, ...groups, approve, reject));
+}
+
+function sessionRow(s) {
+  const kill = el("button", { class: "quiet", text: "Sign out" });
+  const all = el("button", { class: "danger", text: `Sign out all of ${s.uid}` });
+  kill.addEventListener("click", () => act(kill, "sign out", "POST", `/umbral/sessions/${encodeURIComponent(s.handle)}/kill`, {}, () => `signed out one session of ${s.uid}`));
+  all.addEventListener("click", () => act(all, "sign out", "POST", "/umbral/sessions/kill", { uid: s.uid }, (d) => `signed out ${d.killed} sessions of ${s.uid}`));
+  return el("div", { class: "row" },
+    el("div", { class: "head" },
+      el("span", { class: "email", text: s.uid }),
+      el("span", { text: `${s.provider} subject ${s.subject}` }),
+      el("span", { class: "meta", text: `since ${new Date(s.created).toLocaleString()} · last ${new Date(s.last_seen).toLocaleString()}` })),
+    el("div", { class: "fields" }, kill, all));
+}
+
+function eventRow(e) {
+  const unlink = el("button", { class: "danger", text: "Remove link" });
+  unlink.addEventListener("click", () => {
+    if (confirm(`Remove ${e.provider} from ${e.uid}?`)) act(unlink, "unlink", "POST", `/umbral/accounts/${encodeURIComponent(e.uid)}/unlink`, { provider: e.provider }, () => `removed ${e.provider} from ${e.uid}`);
+  });
+  return el("div", { class: "row" },
+    el("div", { class: "head" },
+      el("span", { class: "email", text: e.uid }),
+      el("span", { text: `${e.action} ${e.provider} subject ${e.subject}` }),
+      el("span", { class: "meta", text: `${when(e.at)} · by ${e.by}` + (e.notified ? ` · told: ${e.notified}` : "") })),
+    e.action === "link" || e.action === "approve" ? el("div", { class: "fields" }, unlink) : null);
+}
+
+async function loadUmbral() {
+  const req = await call("GET", "/umbral/requests?state=pending");
+  fill("umbral-pending", req.rows, umbralRow);
+  if (req.ingest !== "ok") say("umbral's request spool was refused at read; see mint's journal", true);
+  const ev = await call("GET", "/umbral/events");
+  fill("umbral-events", ev.events, eventRow);
+  try {
+    const ses = await call("GET", "/umbral/sessions");
+    fill("umbral-sessions", ses.sessions, sessionRow);
+  } catch (e) {
+    say("sessions: " + e.message, true);
+  }
+}
+
 function fill(id, rows, render) {
   const box = $(id);
   box.replaceChildren(...(rows.length ? rows.map(render) : [el("p", { class: "empty", text: "none" })]));
@@ -126,12 +193,15 @@ async function load() {
   fill("invites", rows.filter((r) => r.state === "approved"), inviteRow);
   fill("decided", rows.filter((r) => r.state === "rejected" || r.state === "retired").reverse(), decidedRow);
   if (data.ingest === "error") say(`the spool could not be read (${data.ingest_errno}); new signups are waiting`, true);
+  if (umbral) await loadUmbral();
 }
 
 async function start() {
   try {
     const cfg = await call("GET", "/admin/config");
     grantable = cfg.grantable;
+    umbral = !!cfg.umbral;
+    $("umbral").hidden = !umbral;
     $("who").textContent = `signed in as ${cfg.user}`;
     await load();
   } catch (e) {

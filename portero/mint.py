@@ -363,7 +363,7 @@ def admin_config():
     denied = forbidden()
     if denied:
         return denied
-    return jsonify(user=caller(), grantable=GRANTABLE)
+    return jsonify(user=caller(), grantable=GRANTABLE, umbral=UMBRAL)
 
 
 @app.get("/admin/<name>")
