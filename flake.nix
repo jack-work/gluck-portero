@@ -380,10 +380,21 @@
                 ] ++ lib.optional (cfg.smtpPasswordFile != null)
                   "smtp_password:${cfg.smtpPasswordFile}";
                 SupplementaryGroups = [ readerGroup ];
+                DynamicUser = false;
+                User = "portero-mint";
+                Group = "portero-mint";
                 MemoryMax = "192M";
                 CPUQuota = "40%";
               };
             })
+
+            {
+              users.users.portero-mint = {
+                isSystemUser = true;
+                group = "portero-mint";
+              };
+              users.groups.portero-mint = { };
+            }
 
             {
               services.kelliher-web.sites.gluck-portero-mint = {
