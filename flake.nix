@@ -41,6 +41,7 @@
         cp ${./portero/admin.js}         $out/admin.js
         cp ${./portero/admin.css}        $out/admin.css
         cp ${./portero/journal.py}       $out/journal.py
+        cp ${./portero/umbral.py}        $out/umbral.py
       '';
 
       nixosModule =
@@ -62,6 +63,9 @@
               (_: u: u.group == readerGroup || lib.elem readerGroup u.extraGroups)
               config.users.users));
           mintGroups = groupsOf config.systemd.services.gluck-portero-mint;
+          ucfg = cfg.umbral;
+          umbralWriterGroup = "umbral-spool";
+          umbralSpoolDir = builtins.dirOf ucfg.spoolFile;
           py = pkgs.python3.withPackages (ps: with ps; [ flask waitress ]);
 
           # The entrypoints import sibling modules, so the package has to reach
@@ -334,6 +338,66 @@
               type = lib.types.int;
               default = 12;
             };
+
+            umbral = {
+              enable = lib.mkEnableOption "umbral's half: its request spool, provider links and sessions";
+
+              spoolFile = lib.mkOption {
+                type = lib.types.str;
+                default = "/var/lib/umbral-spool/requests.jsonl";
+              };
+
+              peerUser = lib.mkOption {
+                type = lib.types.str;
+                default = "umbral";
+                description = "The only user whose connections the link socket serves, by SO_PEERCRED.";
+              };
+
+              linkSocket = lib.mkOption {
+                type = lib.types.str;
+                default = "/run/gluck-portero/link.sock";
+              };
+
+              adminSocket = lib.mkOption {
+                type = lib.types.str;
+                default = "/run/umbral/admin.sock";
+              };
+
+              cap = lib.mkOption {
+                type = lib.types.int;
+                default = 200;
+              };
+
+              notify = {
+                tokenUrl = lib.mkOption {
+                  type = lib.types.str;
+                  default = "";
+                  example = "https://auth.kelliher.info/api/oidc/token";
+                };
+                clientId = lib.mkOption {
+                  type = lib.types.str;
+                  default = "portero-notify";
+                };
+                heraldUrl = lib.mkOption {
+                  type = lib.types.str;
+                  default = "https://herald.kelliher.info";
+                };
+                to = lib.mkOption {
+                  type = lib.types.str;
+                  default = "gluck";
+                };
+                secretFile = lib.mkOption {
+                  type = lib.types.nullOr lib.types.path;
+                  default = null;
+                  description = "herald client secret for notify.clientId, by LoadCredential.";
+                };
+                mail = lib.mkOption {
+                  type = lib.types.str;
+                  default = "";
+                  description = "Address mailed when herald cannot be reached.";
+                };
+              };
+            };
           };
 
           config = lib.mkIf cfg.enable (lib.mkMerge [
@@ -395,6 +459,92 @@
               };
               users.groups.portero-mint = { };
             }
+
+            (lib.mkIf ucfg.enable {
+              users.groups.${umbralWriterGroup} = { };
+
+              systemd.tmpfiles.rules = [
+                "d ${umbralSpoolDir} 0711 root root -"
+              ];
+
+              systemd.services.umbral-spool-layout = {
+                description = "gluck-portero: hold umbral's request spool's owner, mode, ACL and append-only flag";
+                after = [
+                  "local-fs.target"
+                  "systemd-tmpfiles-setup.service"
+                  "systemd-tmpfiles-resetup.service"
+                ];
+                before = [ "sysinit-reactivation.target" ];
+                requiredBy = [ "sysinit-reactivation.target" ];
+                environment = {
+                  PORTERO_SPOOL = ucfg.spoolFile;
+                  PORTERO_READER_GROUP = readerGroup;
+                  PORTERO_WRITER_GROUP = umbralWriterGroup;
+                  PORTERO_SPOOL_LABEL = "umbral";
+                  PORTERO_FAIL_UNIT = "";
+                };
+                path = [ pkgs.coreutils pkgs.e2fsprogs pkgs.acl pkgs.gnused ];
+                serviceConfig = {
+                  Type = "oneshot";
+                  ExecStart = "${pkgs.bash}/bin/bash ${./portero/spool-layout.sh}";
+                };
+              };
+
+              systemd.sockets.gluck-portero-link = {
+                description = "gluck-portero: umbral's link socket";
+                wantedBy = [ "sockets.target" ];
+                listenStreams = [ ucfg.linkSocket ];
+                socketConfig = {
+                  Service = "gluck-portero-mint.service";
+                  FileDescriptorName = "link";
+                  SocketUser = ucfg.peerUser;
+                  SocketGroup = "root";
+                  SocketMode = "0600";
+                  DirectoryMode = "0755";
+                };
+              };
+
+              systemd.services.gluck-portero-mint = {
+                after = [ "umbral-spool-layout.service" "gluck-portero-link.socket" ];
+                requires = [ "umbral-spool-layout.service" "gluck-portero-link.socket" ];
+                environment = {
+                  PORTERO_UMBRAL = "1";
+                  PORTERO_UMBRAL_SPOOL = ucfg.spoolFile;
+                  PORTERO_UMBRAL_CAP = toString ucfg.cap;
+                  PORTERO_UMBRAL_READER_GROUP = readerGroup;
+                  PORTERO_UMBRAL_WRITER_GROUP = umbralWriterGroup;
+                  PORTERO_UMBRAL_ADMIN_SOCKET = ucfg.adminSocket;
+                  PORTERO_UMBRAL_PEER = ucfg.peerUser;
+                  PORTERO_NOTIFY_TOKEN_URL = ucfg.notify.tokenUrl;
+                  PORTERO_NOTIFY_CLIENT_ID = ucfg.notify.clientId;
+                  PORTERO_NOTIFY_HERALD_URL = ucfg.notify.heraldUrl;
+                  PORTERO_NOTIFY_TO = ucfg.notify.to;
+                  PORTERO_NOTIFY_MAIL = ucfg.notify.mail;
+                };
+                serviceConfig.Sockets = [ "gluck-portero-link.socket" ];
+                serviceConfig.LoadCredential = lib.optional (ucfg.notify.secretFile != null)
+                  "herald_client_secret:${ucfg.notify.secretFile}";
+              };
+
+              assertions = [
+                {
+                  assertion = !(lib.elem umbralWriterGroup mintGroups);
+                  message = "gluck-portero: gluck-portero-mint must not hold ${umbralWriterGroup}, umbral's spool writer group.";
+                }
+                {
+                  assertion = ucfg.peerUser != "portero-mint" && ucfg.peerUser != "root";
+                  message = "gluck-portero: umbral.peerUser must be umbral's own user.";
+                }
+                {
+                  assertion = ucfg.notify.secretFile != null || ucfg.notify.mail != "";
+                  message = "gluck-portero: umbral link notifications need notify.secretFile or notify.mail.";
+                }
+                {
+                  assertion = ucfg.notify.secretFile == null || ucfg.notify.tokenUrl != "";
+                  message = "gluck-portero: notify.secretFile is set but notify.tokenUrl is empty.";
+                }
+              ];
+            })
 
             {
               services.kelliher-web.sites.gluck-portero-mint = {
@@ -647,6 +797,15 @@
             ${py}/bin/python3 test_cli.py 2>&1 | tee $out
           '';
           intake = suite "intake" "test_intake.py";
+          umbral = suite "umbral" "test_umbral.py";
+          umbral-lldap = pkgs.runCommand "portero-umbral-lldap"
+            { nativeBuildInputs = [ py pkgs.lldap pkgs.curl pkgs.coreutils pkgs.cacert ]; } ''
+              set -o pipefail
+              export SRC=${porteroSrc pkgs} SRC_TESTS=${./portero}
+              export HOME=$TMPDIR
+              export SSL_CERT_FILE=${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt
+              bash ${./portero/umbral_lldap.sh} 2>&1 | tee $out
+            '';
           look = pkgs.runCommand "portero-look" { } ''
             set -o pipefail
             PORTERO_SRC=${porteroSrc pkgs} ${py}/bin/python3 ${./portero/test_look.py} 2>&1 | tee $out
@@ -803,6 +962,10 @@
             probe = ./portero/probe_spool.py;
           };
           activation = import ./tests/activation.nix {
+            inherit pkgs;
+            module = nixosModule;
+          };
+          umbral-vm = import ./tests/umbral.nix {
             inherit pkgs;
             module = nixosModule;
           };

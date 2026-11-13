@@ -11,6 +11,7 @@ Reached only through Authelia. Holds lldap_admin. Holds no invite state: the
 token carries its own signed claim.
 """
 
+import grp
 import logging
 import os
 import re
@@ -28,6 +29,7 @@ import journal
 import mailer
 import oidc
 import pending_admin
+import umbral
 from pending_admin import IntakeAdmin, mac_fields
 
 LLDAP_URL = os.environ.get("PORTERO_LLDAP_URL", "http://127.0.0.1:17170")
@@ -53,6 +55,20 @@ GATE = oidc.BearerGate(
     userinfo_url=os.environ.get("PORTERO_OIDC_USERINFO_URL", ""),
     client_ids=os.environ.get("PORTERO_OIDC_CLIENT_IDS", "").split(","),
 )
+
+UMBRAL = os.environ.get("PORTERO_UMBRAL", "") == "1"
+UMBRAL_SPOOL = os.environ.get("PORTERO_UMBRAL_SPOOL", "/var/lib/umbral-spool/requests.jsonl")
+UMBRAL_DB = os.environ.get("PORTERO_UMBRAL_DB", os.path.join(STATE_DIR, "umbral.db"))
+UMBRAL_CAP = int(os.environ.get("PORTERO_UMBRAL_CAP", "200"))
+UMBRAL_READER_GROUP = os.environ.get("PORTERO_UMBRAL_READER_GROUP", "portero-spool-reader")
+UMBRAL_WRITER_GROUP = os.environ.get("PORTERO_UMBRAL_WRITER_GROUP", "umbral-spool")
+UMBRAL_ADMIN_SOCKET = os.environ.get("PORTERO_UMBRAL_ADMIN_SOCKET", "/run/umbral/admin.sock")
+UMBRAL_PEER = os.environ.get("PORTERO_UMBRAL_PEER", "umbral")
+NOTIFY_TOKEN_URL = os.environ.get("PORTERO_NOTIFY_TOKEN_URL", "")
+NOTIFY_CLIENT_ID = os.environ.get("PORTERO_NOTIFY_CLIENT_ID", "")
+NOTIFY_HERALD_URL = os.environ.get("PORTERO_NOTIFY_HERALD_URL", "")
+NOTIFY_TO = os.environ.get("PORTERO_NOTIFY_TO", "gluck")
+NOTIFY_MAIL = os.environ.get("PORTERO_NOTIFY_MAIL", "")
 
 USERNAME_RE = re.compile(r"^[a-z][a-z0-9_-]{2,31}$")
 # lldap owns the uniqueness of an address, enforced by a database constraint.
@@ -452,6 +468,11 @@ def ingest_tick():
 def ingest_every(seconds, stop):
     while not stop.wait(seconds):
         ingest_tick()
+        if UMBRAL:
+            try:
+                umbral_ingest()
+            except Exception:
+                log.exception("umbral ingest outcome=error")
 
 
 @app.get("/intake")
@@ -605,10 +626,270 @@ def send_intake(row_id):
 
 
 
+_umbral = None
+_umbral_lock = threading.Lock()
+
+
+def umbral_gql(query, variables=None, tolerate=()):
+    return gql(lldap_token(), query, variables, tolerate)
+
+
+def umbral_parts():
+    global _umbral
+    with _umbral_lock:
+        if _umbral is None:
+            store = umbral.Store(UMBRAL_DB, UMBRAL_CAP)
+            directory = umbral.Directory(umbral_gql)
+            secret = os.path.join(os.environ.get("CREDENTIALS_DIRECTORY", ""), "herald_client_secret")
+            notifier = umbral.Notifier(
+                token_url=NOTIFY_TOKEN_URL, client_id=NOTIFY_CLIENT_ID,
+                secret_file=secret if os.path.exists(secret) else "",
+                herald_url=NOTIFY_HERALD_URL, to=NOTIFY_TO,
+                mail=(lambda text: mailer.send_note(NOTIFY_MAIL, "umbral link", text)) if NOTIFY_MAIL else None,
+            )
+            _umbral = {
+                "store": store,
+                "dir": directory,
+                "linker": umbral.Linker(directory, store, notifier),
+                "sessions": umbral.Sessions(UMBRAL_ADMIN_SOCKET),
+            }
+        return _umbral
+
+
+def umbral_ingest():
+    parts = umbral_parts()
+    try:
+        fd = umbral.open_checked(UMBRAL_SPOOL, grp.getgrnam(UMBRAL_READER_GROUP).gr_gid,
+                                 grp.getgrnam(UMBRAL_WRITER_GROUP).gr_gid)
+    except (umbral.LayoutWrong, OSError, KeyError) as exc:
+        log.error("umbral ingest outcome=refused reason=%s", str(exc) or type(exc).__name__)
+        return "refused"
+    try:
+        landed, skipped, offset = parts["store"].ingest(fd)
+    except umbral.LayoutWrong as exc:
+        log.error("umbral ingest outcome=refused reason=%s", exc)
+        return "refused"
+    finally:
+        os.close(fd)
+    level = logging.WARNING if skipped else logging.INFO
+    log.log(level, "umbral ingest outcome=ok landed=%d skipped=%d offset=%d", landed, skipped, offset)
+    return "ok"
+
+
+def umbral_disabled():
+    if not UMBRAL:
+        return jsonify(error="umbral is not enabled here"), 404
+    return forbidden()
+
+
+UMBRAL_ROW = ("id", "provider", "subject", "email", "hd", "name", "note", "received_at",
+              "state", "username", "decided_by", "decided_at")
+
+
+@app.get("/umbral/requests")
+def umbral_requests():
+    denied = umbral_disabled()
+    if denied:
+        return denied
+    state = request.args.get("state", "pending")
+    ingest = umbral_ingest()
+    parts = umbral_parts()
+    rows = []
+    for r in parts["store"].listing(state=None if state == "all" else state):
+        row = {k: r[k] for k in UMBRAL_ROW}
+        row["workspace_warning"] = (
+            f"{r['email']} is a Google Workspace address ({r['hd']}). That domain's "
+            "administrator can sign in as this person (same subject), so they can act as "
+            "this friend." if r["provider"] == "google" and r["hd"] else "")
+        row["claims_existing"] = []
+        if r["state"] == "pending":
+            row["claims_existing"] = parts["dir"].by_email(r["email"])
+        rows.append(row)
+    return jsonify(rows=rows, ingest=ingest, grantable=GRANTABLE)
+
+
+@app.post("/umbral/requests/<int:row_id>/approve")
+def umbral_approve(row_id):
+    denied = umbral_disabled()
+    if denied:
+        return denied
+    body = request.get_json(silent=True) or {}
+    username = (body.get("username") or "").strip().lower()
+    display_name = (body.get("display_name") or "").strip()
+    groups = body.get("site_access_groups") or []
+    parts = umbral_parts()
+    row = parts["store"].get(row_id)
+    if row is None:
+        return jsonify(error="no such request"), 404
+    if row["state"] != "pending":
+        return jsonify(error=f"request is {row['state']}, not pending"), 409
+    bad = invalid(username, row["email"], DEFAULT_TTL, groups)
+    if bad:
+        return bad
+    if not parts["store"].claim(row_id, username, caller()):
+        return jsonify(error="request was decided by someone else"), 409
+    try:
+        payload, status = provision_linked(parts, username, row, display_name or row["name"], groups)
+    except Exception:
+        parts["store"].release(row_id)
+        raise
+    if status != 201:
+        parts["store"].release(row_id)
+        return jsonify(payload), status
+    parts["store"].record("approve", username, row["provider"], row["subject"], caller())
+    try:
+        parts["sessions"].clear_pending(row["provider"], row["subject"])
+    except OSError as exc:
+        log.error("umbral pending not cleared for %s %s: %s", row["provider"], row["subject"], type(exc).__name__)
+    try:
+        mailer.send_welcome(row["email"], umbral.LABELS[row["provider"]])
+        payload["mailed"] = True
+    except mailer.MailFailed as exc:
+        log.error("umbral welcome mail failed for %r: %r", username, str(exc))
+        payload["mailed"] = False
+        payload["mail_error"] = str(exc)
+    log.info("umbral request %s approved as %r by %r, groups %s", row_id, username, caller(), payload["site_access_groups"])
+    return jsonify(payload), 201
+
+
+def provision_linked(parts, username, row, display_name, groups):
+    token = lldap_token()
+    if user_exists(token, username):
+        return {"error": "user already exists"}, 409
+    if parts["dir"].holders(row["provider"], row["subject"]):
+        return {"error": "this provider account is already linked to an account"}, 409
+    group_ids = {}
+    for g in groups:
+        gid = group_id(token, g)
+        if gid is None:
+            return {"error": f"group does not exist in the directory: {g}"}, 400
+        group_ids[g] = gid
+    try:
+        gql(
+            token,
+            "mutation($u:CreateUserInput!){createUser(user:$u){id}}",
+            {"u": {"id": username, "email": row["email"], "displayName": display_name,
+                   "attributes": [{"name": umbral.PROVIDERS[row["provider"]], "value": [row["subject"]]}]}},
+        )
+    except RuntimeError as exc:
+        if EMAIL_TAKEN not in str(exc):
+            raise
+        return {"error": "that email address already belongs to an account; "
+                         "its holder links a provider at login.kelliher.info/link"}, 409
+    for g, gid in group_ids.items():
+        gql(token, "mutation($u:String!,$g:Int!){addUserToGroup(userId:$u,groupId:$g){ok}}",
+            {"u": username, "g": gid})
+    holders = parts["dir"].holders(row["provider"], row["subject"])
+    if holders != [username]:
+        log.error("umbral approval left %s %s on %r", row["provider"], row["subject"], holders)
+        return {"error": "subject ended up on more than one account; check lldap"}, 409
+    return {"username": username, "provider": row["provider"], "subject": row["subject"],
+            "site_access_groups": sorted(group_ids)}, 201
+
+
+@app.post("/umbral/requests/<int:row_id>/reject")
+def umbral_reject(row_id):
+    denied = umbral_disabled()
+    if denied:
+        return denied
+    parts = umbral_parts()
+    row = parts["store"].get(row_id)
+    if row is None or not parts["store"].reject(row_id, caller()):
+        return jsonify(error="no pending request with that id"), 409
+    try:
+        parts["sessions"].clear_pending(row["provider"], row["subject"])
+    except OSError as exc:
+        log.error("umbral pending not cleared for %s %s: %s", row["provider"], row["subject"], type(exc).__name__)
+    log.info("umbral request %s rejected by %r", row_id, caller())
+    return jsonify(rejected=row_id), 200
+
+
+@app.get("/umbral/events")
+def umbral_events():
+    denied = umbral_disabled()
+    if denied:
+        return denied
+    return jsonify(events=umbral_parts()["store"].events())
+
+
+@app.post("/umbral/accounts/<uid>/unlink")
+def umbral_unlink(uid):
+    denied = umbral_disabled()
+    if denied:
+        return denied
+    provider = (request.get_json(silent=True) or {}).get("provider", "")
+    try:
+        subject = umbral_parts()["linker"].unlink(uid, provider, caller())
+    except umbral.Refused as exc:
+        return jsonify(error=exc.reason), exc.status
+    return jsonify(unlinked=uid, provider=provider, subject=subject), 200
+
+
+@app.get("/umbral/sessions")
+def umbral_sessions():
+    denied = umbral_disabled()
+    if denied:
+        return denied
+    try:
+        rows = umbral_parts()["sessions"].listing(request.args.get("uid", ""))
+    except (OSError, RuntimeError) as exc:
+        log.error("umbral admin unreachable: %s", type(exc).__name__)
+        return jsonify(error="umbral is unreachable"), 502
+    return jsonify(sessions=rows)
+
+
+@app.post("/umbral/sessions/<handle>/kill")
+def umbral_kill(handle):
+    denied = umbral_disabled()
+    if denied:
+        return denied
+    try:
+        ok = umbral_parts()["sessions"].kill(handle)
+    except OSError as exc:
+        log.error("umbral admin unreachable: %s", type(exc).__name__)
+        return jsonify(error="umbral is unreachable"), 502
+    if not ok:
+        return jsonify(error="no such session"), 404
+    log.info("umbral session killed by %r", caller())
+    return jsonify(killed=handle), 200
+
+
+@app.post("/umbral/sessions/kill")
+def umbral_kill_uid():
+    denied = umbral_disabled()
+    if denied:
+        return denied
+    uid = (request.get_json(silent=True) or {}).get("uid", "")
+    if not isinstance(uid, str) or not uid:
+        return jsonify(error="uid required"), 400
+    try:
+        n = umbral_parts()["sessions"].kill_uid(uid)
+    except (OSError, RuntimeError) as exc:
+        log.error("umbral admin unreachable: %s", type(exc).__name__)
+        return jsonify(error="umbral is unreachable"), 502
+    log.info("umbral sessions of %r killed by %r: %d", uid, caller(), n)
+    return jsonify(killed=n, uid=uid), 200
+
+
+
 def inherited_sockets():
     if os.environ.get("LISTEN_PID") != str(os.getpid()):
-        return []
-    return [socket.socket(fileno=3 + i) for i in range(int(os.environ.get("LISTEN_FDS", "0")))]
+        return {}
+    count = int(os.environ.get("LISTEN_FDS", "0"))
+    names = os.environ.get("LISTEN_FDNAMES", "").split(":") if os.environ.get("LISTEN_FDNAMES") else []
+    out = {}
+    for i in range(count):
+        name = names[i] if i < len(names) else "unknown"
+        out.setdefault(name, []).append(socket.socket(fileno=3 + i))
+    return out
+
+
+def serve_umbral_links(socks):
+    if len(socks) != 1:
+        sys.exit("want exactly one socket named link")
+    server = umbral.LinkServer(socks[0], umbral_parts()["linker"], UMBRAL_PEER)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    return server
 
 
 def main():
@@ -616,7 +897,15 @@ def main():
     if INGEST_SECONDS > 0:
         threading.Thread(target=ingest_every, args=(INGEST_SECONDS, threading.Event()), daemon=True).start()
     from waitress import serve
-    sockets = inherited_sockets()
+    named = inherited_sockets()
+    if UMBRAL:
+        umbral_parts()["dir"].ensure_attributes()
+        if "link" not in named:
+            sys.exit("umbral is enabled but systemd passed no socket named link")
+        serve_umbral_links(named.pop("link"))
+    elif "link" in named:
+        sys.exit("a link socket was passed but umbral is not enabled")
+    sockets = [s for socks in named.values() for s in socks]
     if sockets:
         serve(app, sockets=sockets, threads=4, ident=None)
     elif os.environ.get("PORTERO_LISTEN") == "socket":

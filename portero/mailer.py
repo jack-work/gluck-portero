@@ -75,10 +75,46 @@ def _message(to, url, expires_at):
     return msg
 
 
+WELCOME_SUBJECT = "You're in at kelliher.info"
+WELCOME_BODY = """Hello,
+
+Gluck has let you in. Sign in at
+
+  https://login.kelliher.info/
+
+with the {provider} account you used to ask. There is no password to set.
+
+If you were not expecting this, ignore it.
+"""
+
+
+def _plain(to, subject, body):
+    msg = EmailMessage()
+    msg["From"] = SENDER
+    msg["To"] = to
+    msg["Subject"] = subject
+    msg["Date"] = formatdate(localtime=True)
+    msg["Message-ID"] = make_msgid(domain="kelliher.info")
+    msg["Auto-Submitted"] = "auto-generated"
+    msg.set_content(body)
+    return msg
+
+
+def send_welcome(to, provider_label):
+    _send(to, _plain(to, WELCOME_SUBJECT, WELCOME_BODY.format(provider=provider_label)))
+
+
+def send_note(to, subject, body):
+    _send(to, _plain(to, subject, body))
+
+
 def send_invite(to, url, expires_at):
+    _send(to, _message(to, url, expires_at))
+
+
+def _send(to, msg):
     if not configured():
         raise MailFailed("smtp is not configured on this unit")
-    msg = _message(to, url, expires_at)
     try:
         with smtplib.SMTP(HOST, PORT, timeout=TIMEOUT) as smtp:
             smtp.ehlo()
