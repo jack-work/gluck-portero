@@ -102,6 +102,10 @@ pkgs.testers.runNixOSTest {
     gql('mutation{createGroup(name:"friends"){id}}')
     m.succeed(f"curl -fsS {mint}/healthz")
 
+    with subtest("mint runs as portero-mint with RemoveIPC"):
+        props = m.succeed("systemctl show gluck-portero-mint -p User -p DynamicUser -p RemoveIPC").split()
+        assert sorted(props) == ["DynamicUser=no", "RemoveIPC=yes", "User=portero-mint"], props
+
     with subtest("U6: mint created both link attributes admin-only"):
         a = {x["name"]: x for x in gql("query{schema{userSchema{attributes{name isVisible isEditable}}}}")["data"]["schema"]["userSchema"]["attributes"]}
         for n in ("umbral-google-sub", "umbral-github-id"):

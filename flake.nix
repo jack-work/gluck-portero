@@ -447,6 +447,7 @@
                 DynamicUser = false;
                 User = "portero-mint";
                 Group = "portero-mint";
+                RemoveIPC = true;
                 MemoryMax = "192M";
                 CPUQuota = "40%";
               };
