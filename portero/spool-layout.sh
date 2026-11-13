@@ -14,10 +14,14 @@ group:$PORTERO_WRITER_GROUP:-w-
 mask::rw-
 other::---"
 
-say() { echo "$1 intake spool layout $2"; }
+LABEL=${PORTERO_SPOOL_LABEL:-intake}
+FAIL_UNIT=${PORTERO_FAIL_UNIT-gluck-portero-intake.service}
+
+say() { echo "$1 $LABEL spool layout $2"; }
 
 fail_closed() {
-  "$SYSTEMCTL" stop --no-block gluck-portero-intake.service || say "<3>ERROR" "could not stop intake"
+  [ -n "$FAIL_UNIT" ] || return 0
+  "$SYSTEMCTL" stop --no-block "$FAIL_UNIT" || say "<3>ERROR" "could not stop $FAIL_UNIT"
 }
 
 on_error() {
