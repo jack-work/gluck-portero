@@ -320,6 +320,35 @@ anyone deploying spain.
 hit a bad deploy will reach for rollback without knowing it reopens nine doors,
 which is why it is written here and in the deploy notes rather than remembered.
 
+## umbral: Google and GitHub sign-in
+
+umbral (login.kelliher.info) is a separate service. Portero touches it in three
+places, each enabled only by `services.gluck-portero.umbral.enable`.
+
+| surface | who reaches it | what it can do |
+|---|---|---|
+| umbral's request spool, `/var/lib/umbral-spool/requests.jsonl` | umbral appends through the `umbral-spool` ACL entry (write only); mint reads through `portero-spool-reader` | mint opens it, proves owner root, group reader, mode 0660, the exact ACL and `+a` on that same descriptor, and only then reads. Any difference: nothing is read and the journal says `umbral ingest outcome=refused reason=...` |
+| the link socket, `/run/gluck-portero/link.sock` | the socket file is 0600 owned by `umbral`; mint also checks SO_PEERCRED against `umbral`'s uid, resolved by name per connection | write one link attribute on the account umbral names from its Authelia two-factor `Remote-User`, only if the account's mail equals the provider's verified email, the account has no link for that provider, and no account holds the subject. Every write is recorded with its time and told to Gluck by herald, or by mail when herald fails |
+| umbral's admin socket, `/run/umbral/admin.sock` | mint, as `portero-mint` | list and end umbral sessions, clear umbral's pending mark after a decision |
+
+Approval of a Google or GitHub request creates the account exactly as an
+invite does, credential-less, with the subject attribute already set; it never
+links an existing account. A request whose address an account already holds is
+refused by lldap's address constraint and shown as "claims an existing
+address".
+
+Measured on lldap 0.6.3: `umbral-google-sub` and `umbral-github-id` are
+created invisible and not user-editable, and a user's own GraphQL insert of
+either is refused. A user's own `removeAttributes` of either succeeds, and a
+user may change their own `mail` through GraphQL; LDAP modify of any attribute
+but `userPassword` is refused for everyone. So a holder can unlink themself,
+never link.
+
+What umbral could do if compromised: link a provider account it controls to
+any account that has no link for that provider. The email it sends is its own
+claim, and it can read every account's mail over its read-only LDAP bind, so the
+mail check binds an honest umbral only. Gluck hears of every such write.
+
 ## What this service deliberately does not do
 
 | | why |
