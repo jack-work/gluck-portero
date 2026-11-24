@@ -797,9 +797,9 @@ def umbral_reject(row_id):
     if row is None or not parts["store"].reject(row_id, caller()):
         return jsonify(error="no pending request with that id"), 409
     try:
-        parts["sessions"].clear_pending(row["provider"], row["subject"])
+        parts["sessions"].mark_denied(row["provider"], row["subject"])
     except OSError as exc:
-        log.error("umbral pending not cleared for %s %s: %s", row["provider"], row["subject"], type(exc).__name__)
+        log.error("umbral denial not marked for %s %s: %s", row["provider"], row["subject"], type(exc).__name__)
     log.info("umbral request %s rejected by %r", row_id, caller())
     return jsonify(rejected=row_id), 200
 

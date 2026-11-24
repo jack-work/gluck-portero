@@ -418,6 +418,8 @@ class Routes(unittest.TestCase):
         self.parts = M.umbral_parts()
         self.cleared = []
         self.parts["sessions"].clear_pending = lambda p, s: self.cleared.append((p, s)) or True
+        self.denied = []
+        self.parts["sessions"].mark_denied = lambda p, s: self.denied.append((p, s)) or True
         M.umbral_ingest = lambda: "ok"
         self.welcomed = []
         mailer.send_welcome = lambda to, label: self.welcomed.append((to, label))
@@ -487,7 +489,7 @@ class Routes(unittest.TestCase):
     def test_reject(self):
         rid = self.add(subject="6")
         self.assertEqual(self.c.post(f"/umbral/requests/{rid}/reject", headers=self.as_admin(), json={}).status_code, 200)
-        self.assertEqual(self.cleared, [("google", "6")])
+        self.assertEqual(self.denied, [("google", "6")])
         self.assertEqual(self.c.post(f"/umbral/requests/{rid}/reject", headers=self.as_admin(), json={}).status_code, 409)
 
 

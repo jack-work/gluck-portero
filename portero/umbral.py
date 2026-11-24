@@ -467,6 +467,10 @@ class Sessions:
         status, _ = self._call("DELETE", f"/pending/{urllib.parse.quote(provider, safe='')}/{urllib.parse.quote(subject, safe='')}")
         return status in (204, 404)
 
+    def mark_denied(self, provider, subject):
+        status, _ = self._call("PUT", f"/denied/{urllib.parse.quote(provider, safe='')}/{urllib.parse.quote(subject, safe='')}")
+        return status == 204
+
 
 def peer_uid(sock):
     raw = sock.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i"))
