@@ -115,8 +115,9 @@ function decidedRow(r) {
 }
 
 function umbralRow(r) {
-  const user = el("input", { type: "text", placeholder: "username", size: "16", value: suggest(r.email) });
+  const user = el("input", { type: "text", placeholder: "username", size: "16", value: r.suggested_username ?? suggest(r.email) });
   const boxes = grantable.map((g) => el("input", { type: "checkbox", value: g, id: `u-${r.id}-${g}` }));
+  const asked = r.suggested_from === "typed" ? `asked for username ${r.suggested_username}` : "no username typed; prefilled from the email";
   const approve = el("button", { text: "Approve" });
   const reject = el("button", { class: "quiet", text: "Reject" });
   approve.addEventListener("click", () => act(approve, "approve", "POST", `/umbral/requests/${r.id}/approve`, {
@@ -137,6 +138,7 @@ function umbralRow(r) {
     r.workspace_warning ? el("div", { class: "note err", text: r.workspace_warning }) : null,
     r.claims_existing.length ? el("div", { class: "note err", text: `claims an existing address: ${r.claims_existing.join(", ")}. Never approve this to link; that account's holder links at login.kelliher.info/link.` }) : null,
     r.note ? el("div", { class: "note", text: r.note }) : null,
+    r.suggested_from ? el("div", { class: r.suggested_problem ? "note err" : "note", text: asked + (r.suggested_problem ? `: ${r.suggested_problem}` : "") }) : null,
     el("div", { class: "fields" }, user, ...groups, approve, reject));
 }
 

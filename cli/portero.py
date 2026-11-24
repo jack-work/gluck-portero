@@ -117,6 +117,51 @@ def cmd_send(args):
          lambda d: f"mailed #{args.id} to {d['username']}, link expires {when(d['expires_at'])}")
 
 
+def umbral_pending(row_id):
+    for r in call("GET", "/umbral/requests")["rows"]:
+        if r["id"] == row_id:
+            return r
+    raise Failed(f"no pending umbral request #{row_id}")
+
+
+def cmd_umbral_list(args):
+    data = call("GET", "/umbral/requests" + ("?state=all" if args.all else ""))
+
+    def human(d):
+        rows = [dict(r, received=when(r["received_at"]),
+                     username=r.get("username") or r.get("suggested_username") or "",
+                     problem=r.get("suggested_problem") or "",
+                     note=(r["note"] or "").replace("\n", " ")[:40])
+                for r in sorted(d["rows"], key=lambda r: r["id"])]
+        if not rows:
+            return "no pending requests" if not args.all else "no requests"
+        columns = [("id", "ID"), ("state", "STATE"), ("email", "EMAIL"), ("name", "NAME"), ("username", "USER"),
+                   ("problem", "PROBLEM"), ("received", "RECEIVED"), ("note", "NOTE")]
+        if not args.all:
+            columns = [c for c in columns if c[0] != "state"]
+        return table(rows, columns)
+
+    show(args, data, human)
+
+
+def cmd_umbral_approve(args):
+    username = args.username
+    if not username:
+        row = umbral_pending(args.id)
+        username = row.get("suggested_username") or ""
+        if not username or row.get("suggested_problem"):
+            raise Failed(f"#{args.id}: no usable prefilled username ({row.get('suggested_problem') or 'none'}); give one")
+    body = {"username": username, "display_name": args.name or "",
+            "site_access_groups": [s for s in (args.sites or "").split(",") if s]}
+    data = call("POST", f"/umbral/requests/{args.id}/approve", body)
+    show(args, data, lambda d: f"approved #{args.id} as {d['username']}, "
+                               + ("told by mail" if d.get("mailed") else f"mail FAILED: {d.get('mail_error')}"))
+
+
+def cmd_umbral_reject(args):
+    show(args, call("POST", f"/umbral/requests/{args.id}/reject", {}), lambda d: f"rejected #{args.id}")
+
+
 def parser():
     p = argparse.ArgumentParser(prog="portero", description="Handle portero's signup intake from a terminal.")
     p.add_argument("--json", action="store_true", help="print the server's JSON instead of a table")
@@ -137,7 +182,21 @@ def parser():
         c = sub.add_parser(name, help=text)
         c.add_argument("id", type=int)
         c.set_defaults(run=run)
-    for c in sub.choices.values():
+    u = sub.add_parser("umbral", help="requests from Google or GitHub sign-ins at login.kelliher.info")
+    usub = u.add_subparsers(dest="umbral_command", required=True)
+    ul = usub.add_parser("list", help="list requests (pending unless --all), with the username to prefill")
+    ul.add_argument("--all", action="store_true", help="every state, not only pending")
+    ul.set_defaults(run=cmd_umbral_list)
+    ua = usub.add_parser("approve", help="create the linked account; the username defaults to the one prefilled")
+    ua.add_argument("id", type=int)
+    ua.add_argument("username", nargs="?", default="")
+    ua.add_argument("--sites", help="comma-separated site access groups to grant")
+    ua.add_argument("--name", help="display name")
+    ua.set_defaults(run=cmd_umbral_approve)
+    ur = usub.add_parser("reject", help="refuse a pending request")
+    ur.add_argument("id", type=int)
+    ur.set_defaults(run=cmd_umbral_reject)
+    for c in list(sub.choices.values()) + list(usub.choices.values()):
         c.add_argument("--json", action="store_true", default=argparse.SUPPRESS, help=argparse.SUPPRESS)
     return p
 

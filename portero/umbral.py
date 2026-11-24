@@ -33,6 +33,7 @@ EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 HD_RE = re.compile(r"^[a-z0-9.-]{1,253}$")
 NAME_MAX = 100
 NOTE_MAX = 500
+USERNAME_RE = re.compile(r"^[a-z][a-z0-9_-]{2,31}$")
 RECORD_MAX = 4096
 
 FS_IOC_GETFLAGS = 0x80086601
@@ -135,8 +136,12 @@ def parse(line):
         at = calendar.timegm(time.strptime(fields["at"], "%Y-%m-%dT%H:%M:%SZ"))
     except ValueError:
         return None
+    wanted = row.get("username", "")
+    if not isinstance(wanted, str) or not USERNAME_RE.fullmatch(wanted):
+        wanted = ""
     return {"provider": provider, "subject": fields["subject"], "email": fields["email"],
-            "hd": fields["hd"], "name": fields["name"], "note": fields["note"], "received_at": at}
+            "hd": fields["hd"], "name": fields["name"], "note": fields["note"], "wanted": wanted,
+            "received_at": at}
 
 
 SCHEMA = """
@@ -148,6 +153,7 @@ CREATE TABLE IF NOT EXISTS requests (
   hd          TEXT NOT NULL DEFAULT '',
   name        TEXT NOT NULL,
   note        TEXT NOT NULL DEFAULT '',
+  wanted      TEXT NOT NULL DEFAULT '',
   received_at INTEGER NOT NULL,
   state       TEXT NOT NULL DEFAULT 'pending',
   username    TEXT,
@@ -183,6 +189,9 @@ class Store:
         self._db.execute("PRAGMA synchronous=FULL")
         self._db.execute("PRAGMA busy_timeout=5000")
         self._db.executescript(SCHEMA)
+        columns = {r[1] for r in self._db.execute("PRAGMA table_info(requests)")}
+        if "wanted" not in columns:
+            self._db.execute("ALTER TABLE requests ADD COLUMN wanted TEXT NOT NULL DEFAULT ''")
 
     def _rows(self, sql, args=()):
         with self._lock:
@@ -217,8 +226,8 @@ class Store:
                         if pending >= self.cap:
                             break
                         cur = self._db.execute(
-                            "INSERT OR IGNORE INTO requests (provider, subject, email, hd, name, note, received_at) "
-                            "VALUES (:provider, :subject, :email, :hd, :name, :note, :received_at)", row)
+                            "INSERT OR IGNORE INTO requests (provider, subject, email, hd, name, note, wanted, received_at) "
+                            "VALUES (:provider, :subject, :email, :hd, :name, :note, :wanted, :received_at)", row)
                         landed += cur.rowcount
                         pending += cur.rowcount
                     pos = end = line_end

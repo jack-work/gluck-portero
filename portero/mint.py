@@ -71,6 +71,7 @@ NOTIFY_TO = os.environ.get("PORTERO_NOTIFY_TO", "gluck")
 NOTIFY_MAIL = os.environ.get("PORTERO_NOTIFY_MAIL", "")
 
 USERNAME_RE = re.compile(r"^[a-z][a-z0-9_-]{2,31}$")
+RESERVED_USERNAMES = frozenset({"users"})
 # lldap owns the uniqueness of an address, enforced by a database constraint.
 # The constraint is the arbiter rather than a SELECT here, because a pre-check
 # plus an insert is the read-then-write pattern this estate has been bitten by.
@@ -245,6 +246,8 @@ def forbidden():
 def invalid(username, email, ttl, groups):
     if not USERNAME_RE.fullmatch(username):
         return jsonify(error="invalid username (want ^[a-z][a-z0-9_-]{2,31}$)"), 400
+    if username in RESERVED_USERNAMES:
+        return jsonify(error=f"username {username!r} is reserved"), 400
     if not EMAIL_RE.fullmatch(email):
         return jsonify(error="invalid email"), 400
     if not 60 <= ttl <= MAX_TTL:
@@ -682,8 +685,27 @@ def umbral_disabled():
     return forbidden()
 
 
-UMBRAL_ROW = ("id", "provider", "subject", "email", "hd", "name", "note", "received_at",
+UMBRAL_ROW = ("id", "provider", "subject", "email", "hd", "name", "note", "wanted", "received_at",
               "state", "username", "decided_by", "decided_at")
+
+
+def suggested_username(row):
+    if row.get("wanted"):
+        return row["wanted"], "typed"
+    local = re.sub(r"[^a-z0-9_-]", "", row["email"].split("@")[0].lower())[:32]
+    return (local, "email") if re.match(r"[a-z]", local) else ("", "email")
+
+
+def username_problem(name, exists):
+    if not name:
+        return "no usable name; type one"
+    if not USERNAME_RE.fullmatch(name):
+        return "outside the username rule"
+    if name in RESERVED_USERNAMES:
+        return "reserved"
+    if exists(name):
+        return "already taken"
+    return ""
 
 
 @app.get("/umbral/requests")
@@ -695,6 +717,13 @@ def umbral_requests():
     ingest = umbral_ingest()
     parts = umbral_parts()
     rows = []
+    tokens = []
+
+    def taken(name):
+        if not tokens:
+            tokens.append(lldap_token())
+        return user_exists(tokens[0], name)
+
     for r in parts["store"].listing(state=None if state == "all" else state):
         row = {k: r[k] for k in UMBRAL_ROW}
         row["workspace_warning"] = (
@@ -704,6 +733,9 @@ def umbral_requests():
         row["claims_existing"] = []
         if r["state"] == "pending":
             row["claims_existing"] = parts["dir"].by_email(r["email"])
+            name, source = suggested_username(r)
+            row["suggested_username"], row["suggested_from"] = name, source
+            row["suggested_problem"] = username_problem(name, taken)
         rows.append(row)
     return jsonify(rows=rows, ingest=ingest, grantable=GRANTABLE)
 

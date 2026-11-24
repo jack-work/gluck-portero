@@ -48,6 +48,14 @@ class Parse(unittest.TestCase):
         self.assertEqual(r["hd"], "example.com")
         self.assertEqual(r["received_at"], 1794524400)
 
+    def test_wanted_username_kept_only_inside_the_rule(self):
+        self.assertEqual(U.parse(record(username="mom")[:-1])["wanted"], "mom")
+        self.assertEqual(U.parse(record()[:-1])["wanted"], "")
+        for bad in ("Mom", "mo", "1mom", 7, "m" * 33):
+            r = U.parse(record(username=bad)[:-1])
+            self.assertIsNotNone(r, bad)
+            self.assertEqual(r["wanted"], "", bad)
+
     def test_refused(self):
         cases = {
             "version": dict(v=2),
@@ -150,6 +158,19 @@ class Ingest(unittest.TestCase):
             return self.store.ingest(fd)
         finally:
             os.close(fd)
+
+    def test_an_older_table_gains_the_wanted_column_and_ingests_it(self):
+        db = os.path.join(tempfile.mkdtemp(), "old.db")
+        import sqlite3
+        old = sqlite3.connect(db)
+        old.executescript(U.SCHEMA.replace("  wanted      TEXT NOT NULL DEFAULT '',\n", ""))
+        old.execute("INSERT INTO requests (provider, subject, email, name, received_at) VALUES ('google','1','a@example.com','A',1)")
+        old.commit()
+        old.close()
+        self.store = U.Store(db, cap=3)
+        self.write(record(subject="2", username="mom"))
+        self.assertEqual(self.ingest()[0], 1)
+        self.assertEqual([r["wanted"] for r in self.store.listing("pending")], ["", "mom"])
 
     def test_lines_offsets_and_cap(self):
         self.write(record(subject="1") + b"garbage\n" + record(subject="2") + b'{"v":1,"provider"')
@@ -428,8 +449,8 @@ class Routes(unittest.TestCase):
     def add(self, **over):
         row = U.parse(record(**over)[:-1])
         self.parts["store"]._db.execute(
-            "INSERT INTO requests (provider, subject, email, hd, name, note, received_at) "
-            "VALUES (:provider, :subject, :email, :hd, :name, :note, :received_at)", row)
+            "INSERT INTO requests (provider, subject, email, hd, name, note, wanted, received_at) "
+            "VALUES (:provider, :subject, :email, :hd, :name, :note, :wanted, :received_at)", row)
         return self.parts["store"].listing("pending")[-1]["id"]
 
     def as_admin(self):
@@ -450,6 +471,26 @@ class Routes(unittest.TestCase):
         self.assertEqual(rows[0]["subject"], "9")
         self.assertEqual(rows[0]["claims_existing"], ["old"])
         self.assertIn("administrator can sign in as this person", rows[0]["workspace_warning"])
+
+    def test_listing_prefills_the_typed_username(self):
+        self.add(subject="1", email="ct@example.com", username="mom")
+        self.add(subject="2", email="Nora.Q@example.com")
+        self.add(subject="3", email="x@example.com", username="old")
+        self.add(subject="4", email="y@example.com", username="users")
+        self.add(subject="5", email="9@example.com")
+        rows = {r["subject"]: r for r in self.c.get("/umbral/requests", headers=self.as_admin()).get_json()["rows"]}
+        got = {k: (r["suggested_username"], r["suggested_from"], r["suggested_problem"]) for k, r in rows.items()}
+        self.assertEqual(got["1"], ("mom", "typed", ""))
+        self.assertEqual(got["2"], ("noraq", "email", ""))
+        self.assertEqual(got["3"], ("old", "typed", "already taken"))
+        self.assertEqual(got["4"], ("users", "typed", "reserved"))
+        self.assertEqual(got["5"], ("", "email", "no usable name; type one"))
+
+    def test_approve_refuses_a_reserved_username(self):
+        rid = self.add(subject="6", email="z@example.com")
+        r = self.c.post(f"/umbral/requests/{rid}/approve", headers=self.as_admin(), json={"username": "users"})
+        self.assertEqual(r.status_code, 400)
+        self.assertEqual(self.parts["store"].get(rid)["state"], "pending")
 
     def test_approve(self):
         rid = self.add(subject="777", email="nora@example.com")
