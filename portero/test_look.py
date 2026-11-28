@@ -36,7 +36,7 @@ class Look(unittest.TestCase):
         r, body = self.get(None)
         self.assertEqual(r.status_code, 200)
         self.assertIn("src: url(data:font/woff2;base64,", body)
-        self.assertIn("'EB Garamond'", body)
+        self.assertIn("'Source Serif 4'", body)
         self.assertIn("'VT323'", body)
         self.assertNotIn("googleapis", body)
         self.assertNotIn("gstatic", body)

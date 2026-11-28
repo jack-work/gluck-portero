@@ -74,5 +74,5 @@ print("faces", faces)
 assert not foreign, f"the page reached off its origin: {foreign}"
 assert not refused, f"the browser refused something under the CSP: {refused}"
 for shot, loaded in faces.items():
-    assert {"Jacquard 24", "EB Garamond", "VT323"} <= set(loaded), (shot, loaded)
+    assert {"Jacquard 24", "Source Serif 4", "VT323"} <= set(loaded), (shot, loaded)
 print("ok")
